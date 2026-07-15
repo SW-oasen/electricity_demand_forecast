@@ -14,8 +14,9 @@
 
 ```
 db/energy_demand.db
-├── energy_demand   (64 576 Zeilen, max: 2026-05-21)
-├── weather         (64 729 Zeilen, max: 2026-05-22)
+├── energy_demand   (inkrementell aktualisierte Last- und Kalenderfeatures)
+├── weather         (inkrementell aktualisierte Wetterfeatures)
+├── etl_metadata    (Versionen ausgeführter ETL-Backfills)
 ├── walk_forward_predictions  (persistierte historische ML-Prognosen)
 └── energy_weather_combined  (VIEW — JOIN beider Tabellen)
 ```
@@ -25,6 +26,7 @@ db/energy_demand.db
 ```
 time, energy_demand_mwh, smard_forecast_mwh, data_source,
 year, hour, weekday, month, is_weekend, is_holiday, holiday_ratio,
+is_school_holiday, school_holiday_ratio,
 is_workday, is_bridge_day, holiday_weight, is_pandemic_time,
 energy_demand_lag_24h, energy_demand_lag_168h,
 energy_demand_rolling_mean_24h, energy_demand_rolling_mean_168h,
@@ -64,6 +66,7 @@ Die DB verwendet snake_case statt PascalCase:
 | `load_weather_data(conn)` | Wettertabelle als DataFrame |
 | `load_combined_data(conn, start_date, end_date)` | View mit optionalem Datumsfilter |
 | `prepare_for_prediction_tomorrow_etl(date, model, db_path)` | Prognostiziert zuerst rekursiv den fehlenden heutigen Tag und erzeugt daraus die Feature-Matrix für morgen |
+| `backfill_calendar_features(conn, ...)` | Befüllt versioniert die bevölkerungsgewichteten Feiertags- und Schulferienfeatures historischer DB-Zeilen |
 | `prediction_store.upsert_predictions(conn, predictions)` | CSV-Ergebnisse idempotent in SQLite speichern |
 | `prediction_store.load_predictions(...)` | Persistierte Walk-Forward-Prognosen nach Modell, Modus und Zeitraum laden |
 
@@ -202,8 +205,8 @@ Features:
 |---|---|
 | `EnergyDemand_lag_24h` | Verbrauch vor 24h (selbe Stunde gestern) |
 | `EnergyDemand_lag_168h` | Verbrauch vor 168h (selbe Stunde letzte Woche) |
-| `EnergyDemand_rolling_mean_24h` | 24h-Rollmittel Verbrauch (shift(24)) |
-| `EnergyDemand_rolling_mean_168h` | 168h-Rollmittel Verbrauch (shift(24)) |
+| `EnergyDemand_rolling_mean_24h` | Mittel der unmittelbar vorherigen 24 Stunden (`shift(1).rolling(24)`) |
+| `EnergyDemand_rolling_mean_168h` | Mittel der unmittelbar vorherigen 168 Stunden (`shift(1).rolling(168)`) |
 
 **ETL-Benennung** (in DB-Schema, `etl.py`, Notebooks 06–08, `streamlit_app_etl.py`):
 
@@ -216,7 +219,7 @@ Features:
 
 > `EnergyDemand_lag_8760h` und `EnergyDemand_rolling_mean_8760h` wurden nach Feature-Importance-Analyse entfernt (geringer Beitrag, erzwang Wegfall des Jahres 2019).
 
-> **Hinweis Rolling-Features**: `shift(24)` stellt sicher, dass das Fenster auf gestern ausgerichtet ist (T-24h bis T-(24+n-1)h). Kein Datenleck durch unmittelbar vorangehende Stunden; konsistente temporale Ausrichtung mit `lag_24h`.
+> **Hinweis Rolling-Features**: `shift(1)` schließt die aktuelle Zielstunde aus. Im Training stammen die Fenster aus den unmittelbar vorherigen Lastwerten; in Walk-forward und operativer Prognose werden unbekannte Stunden rekursiv durch Modellprognosen ersetzt.
 
 ---
 
@@ -243,8 +246,8 @@ beobachtetem Wetter und nicht aus archivierten Wetterprognosen.
 
 | Split | Zeitraum | Verwendung |
 |---|---|---|
-| Training | 2019–2024 | Modelltraining |
-| Test | 2025 | Finale Evaluation |
+| Training | 2019-01-08 bis 2025-09-30 | Modelltraining |
+| Test | ab 2025-10-01 | Finale Walk-forward-Evaluation |
 
 Zeitbasierter Split — kein zufälliges Mischen. Cross-Validation mit `TimeSeriesSplit` (kein Standard-k-Fold, da Datenleck durch Lag-Features).
 
@@ -269,10 +272,11 @@ Für baumbasierte Modelle (Random Forest, XGBoost, LightGBM): kein Preprocessing
 
 ### Hyperparameter-Tuning
 
-Schritt 1: `RandomizedSearchCV` mit `TimeSeriesSplit(n_splits=5)` — respektiert zeitliche Reihenfolge.  
-Schritt 2: Bayesian Optimization mit **Optuna** (`TPESampler`, 100 Trials) 
-- bestes LightGBM-Modell gespeichert als `best_lgbm_model_bayesian.pkl`.  
-- bestes XGBoost-Modell gespeichert als `best_xgb_model_bayesian.pkl`.  
+Die Hyperparameteroptimierung erfolgt mit `BayesSearchCV` und
+`TimeSeriesSplit(n_splits=5)`. Die finalen ETL-Modelle werden als
+`best_lgbm_model_bayesian_etl.pkl` und `best_xgb_model_bayesian_etl.pkl`
+gespeichert. Die berichteten Holdout-Metriken stammen separat aus der
+48-Stunden-Walk-forward-Auswertung.
 
 Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorhersage).
 
@@ -294,6 +298,7 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 - **Timezone-Problem (behoben in ETL-App)**: Matplotlib konvertiert tz-aware Timestamps intern nach UTC beim Plotten. In `streamlit_app_etl.py` werden beide Serien (ML + SMARD) über `_strip_tz()` zu tz-naive Europe/Berlin normiert, bevor sie an matplotlib übergeben werden.
 - **pandas 3.0 Mixed-Timezone-Bug (behoben)**: `pd.to_datetime(col)` wirft `ValueError: Mixed timezones` bei Spalten mit gemischten UTC-Offsets (`+0100`/`+0200`). Fix: `pd.to_datetime(col, utc=True)` in `_parse_time_col` in `etl.py`.
 - **Operative Morgenprognose**: Istwerte werden strikt vor D-1 abgeschnitten. D-1 wird stündlich rekursiv prognostiziert und als Kontext für Zieltag D verwendet.
+- **Historische Wetterevaluation (offen)**: Der aktuelle Modus `walk_forward_48h_actual_weather` verwendet beobachtetes Wetter für D-1 und D und ist deshalb ein Best-Case-Szenario. Geplant ist eine As-of-Auswertung mit archivierten Open-Meteo Single Runs aus einem am Prognosezeitpunkt verfügbaren ECMWF-Modelllauf.
 
 ---
 
@@ -352,9 +357,10 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 - [SMARD Marktdaten - Bundesnetzagentur](https://www.smard.de/page/home/marktdaten/)
 - [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)
 - [Open-Meteo Forecast API](https://open-meteo.com/en/docs)
+- [Open-Meteo Single Runs API](https://open-meteo.com/en/docs/single-runs-api)
 - [python-holidays](https://holidays.readthedocs.io/)
-- [Optuna – Hyperparameter Optimization Framework](https://optuna.readthedocs.io/)
-- [Deutsche Schulferien API](https://ferien-api.maxleistner.de/)
+- [scikit-optimize – BayesSearchCV](https://scikit-optimize.github.io/stable/modules/generated/skopt.BayesSearchCV.html)
+- [Deutsche Schulferien API](https://ferien-api.de/)
 
 ## GitHub
 
@@ -393,7 +399,7 @@ Historische Evaluation und operative Morgenprognose verwenden denselben position
 - [x] Feature Importances und Ferienfeature-Analyse (Notebook 07)
 - [x] Python Source Refactoring /src (`fetch_prepare_data.py`, `train_model_predict.py`)
 - [x] Vollständige ML-Pipeline: Training, Tuning, Persistenz (Notebook 06)
-- [x] Bayesian Hyperparameter-Optimierung mit Optuna auf AI PC
+- [x] Bayesian Hyperparameter-Optimierung mit `BayesSearchCV` und `TimeSeriesSplit`
 - [x] Rolling-Features auf `shift(1).rolling(...)` vereinheitlicht
 - [x] **ETL-Pipeline** (`src/etl.py`): SQLite-DB mit inkrementellem Update; alle Features vorberechnet; Kaggle-CSV + SMARD-API + Open-Meteo-API als Quellen
 - [x] **ETL ML-Pipeline** (Notebook 06): Training von LightGBM und XGBoost auf DB-Daten; Modelle mit `_etl`-Suffix gespeichert
@@ -404,4 +410,5 @@ Historische Evaluation und operative Morgenprognose verwenden denselben position
 
 ### Offen
 
+- [ ] Historische Walk-forward-Evaluation auf archivierte Open-Meteo Single Runs umstellen
 - [ ] Strompreis-Vorhersage — separates Folgeprojekt

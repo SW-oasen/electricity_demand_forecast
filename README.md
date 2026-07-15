@@ -11,7 +11,7 @@ Portfolio-Projekt zur stündlichen Vorhersage des deutschen Stromverbrauchs auf 
 - **Tagesvorhersage**: Stündliche ML-Prognose für den nächsten Tag (00:00–23:00 Europe/Berlin), verglichen mit der offiziellen SMARD-Prognose
 - **Historischer Vergleich**: Tatsächlicher Verbrauch vs. SMARD-Prognose vs. ML-Vorhersage für einen frei wählbaren Zeitraum (bis 1 Jahr) — inkl. MAE und RMSE
 - **ETL-Pipeline**: Inkrementelles SQLite-Datenbank-Update (`etl.py`), das Kaggle-CSV, SMARD-API und Open-Meteo-API kombiniert und alle Features vorberechnet — Basis für schnelle historische Abfragen ohne Live-API-Aufrufe
-- **Modelle**: LightGBM und XGBoost — DB-basiert trainiert auf 2019–2024 und per Walk-Forward evaluiert
+- **Modelle**: LightGBM und XGBoost — DB-basiert bis 2025-09-30 trainiert und ab 2025-10-01 per Walk-forward evaluiert
 
 ---
 
@@ -22,7 +22,7 @@ Voraussetzung: virtuelle Umgebung aktiviert, trainierte Modelle liegen unter `mo
 ### ETL App
 
 ```powershell
-cd d:\Projects\DataScience\Portfolio\electricity_demand_forecast\workspace_energy_demand
+cd C:\Pfad\zum\Projekt\workspace_energy_demand
 .venv\Scripts\Activate.ps1
 python -m streamlit run src/streamlit_app_etl.py
 ```
@@ -34,7 +34,7 @@ Beim ersten Start führt die App `update_database()` aus und befüllt/aktualisie
 | Tab | Funktion |
 |---|---|
 | Vorhersage (morgen) | Energie-Lag-Kontext aus DB + Open-Meteo Wetter-Forecast → ML-Prognose für morgen inkl. SMARD-Vergleichslinie |
-| Historischer Vergleich | DB-Quelldaten → Walk-Forward → CSV-Checkpoint → SQLite-Prognosetabelle; kein Live-API-Abruf, max. 1 Jahr, mit MAE + RMSE |
+| Historischer Vergleich | DB-Quelldaten → Walk-forward → CSV-Checkpoint → SQLite-Prognosetabelle; max. 1 Jahr, mit MAE + RMSE. Lastwerte sind leakage-sicher, historische Wetterfeatures stammen derzeit noch aus beobachtetem Wetter. |
 
 ---
 
@@ -57,6 +57,7 @@ Als interaktive Oberfläche steht zusätzlich Notebook 08 in `notebook/` bereit:
 
 **Teil 2 — Historischer Vergleich (Actual vs. SMARD vs. ML)**
 - Quelldaten werden aus SQLite geladen; fehlende Walk-Forward-Tage werden berechnet
+- Lastwerte werden rekursiv ohne Zukunftswissen erzeugt; beobachtete historische Wetterwerte machen diesen Modus derzeit noch zu einer Best-Case-Auswertung
 - Jeder vollständige Tag wird sofort als CSV gesichert und anschließend in SQLite persistiert
 - Auswählbarer Zeitraum bis maximal 1 Jahr; Live-Validierung verhindert ungültige Auswahl
 - Metriktabelle (MAE, RMSE, Datenpunkte) für ML-Prognose **und** SMARD-Prognose im Vergleich
@@ -97,6 +98,7 @@ Evaluation bewusst aus CSV und Datenbank entfernt werden.
 | [SMARD (Bundesnetzagentur)](https://www.smard.de/home) | Realisierter + prognostizierter Verbrauch (Filter 410 / 411) | — |
 | [Open-Meteo](https://open-meteo.com/en/docs) | Stündliche Wetterdaten 5 Städte DE (Archiv + Forecast) | CC BY 4.0 |
 | [python-holidays](https://holidays.readthedocs.io/) | Deutsche Feiertage, alle 16 Bundesländer | — |
+| [Ferien-API](https://ferien-api.de/) | Schulferien aller Bundesländer; lokal gecacht | — |
 
 
 ### Electricity Market Data
@@ -129,7 +131,7 @@ Die orginal Daten sind bereinigt, aggregiert und transformiert für Machine Lear
 
 - ENTSO-E Day-Ahead-Preise als Feature
 - Industrieproduktionsindex (Destatis, monatlich)
-- Schulferienratio
+- Archivierte Open-Meteo-Modellläufe für eine realistische wetterseitige Walk-forward-Evaluation
 - Mehrere Länder wegen besonderem Klima (FI – Finnland, ES – Spanien)
 - 7-Tage-Forecast (iterative/rekursive Vorhersage)
 
@@ -145,7 +147,7 @@ Die orginal Daten sind bereinigt, aggregiert und transformiert für Machine Lear
 - [SMARD Marktdaten - Bundesnetzagentur](https://www.smard.de/page/home/marktdaten/)
 - [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)
 - [python-holidays](https://holidays.readthedocs.io/)
-- [Deutsche Schulferien API](https://ferien-api.maxleistner.de/)
+- [Deutsche Schulferien API](https://ferien-api.de/)
 
 ## GitHub
 
