@@ -1,5 +1,3 @@
-import pandas as pd
-
 # Split the data into training and testing sets based on the date
 def train_test_split_by_date(df, date_column, target_column, split_date):
     train_data = df[df[date_column] < split_date]
@@ -49,8 +47,6 @@ def init_preprocessor(in_df):
 
 
 # build the model pipeline
-from sklearn.ensemble import RandomForestRegressor
-
 def init_model_pipeline(in_df, model):
     preprocessor = init_preprocessor(in_df)
     model_pipeline = Pipeline(steps=[ 

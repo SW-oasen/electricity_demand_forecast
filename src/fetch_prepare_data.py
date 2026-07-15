@@ -1,8 +1,6 @@
 # --------- fetch the data from Kaggle and save it to the raw data folder ----------
-from functools import lru_cache
 import shutil
 import os
-from typing import Literal
 
 dataset_link = "dsersun/europe-electricity-load-hourly-20192025"  # just the owner/dataset part
 destination = "../data/raw"
@@ -22,12 +20,9 @@ def fetch_kaggle_dataset(in_dataset_link=dataset_link, in_destination=destinatio
 
 # ========== prepare the energy data from Kaggle file for modeling ============
 
-from IPython.display import display
-import numpy as np
 import pandas as pd
 
 orig_file_path = "../data/raw/MHLV_2019_2025_combined.csv"
-processed_file_path = "../data/processed/energy_weather_2019_2025.csv"
 
 
 def prepare_energy_data_for_modeling(file_path=orig_file_path):
@@ -60,18 +55,11 @@ def prepare_energy_data_for_modeling(file_path=orig_file_path):
 
 # --------- scrape SMARD data ----------
 
-import os
-import time
-import requests
-import pandas as pd
-from datetime import datetime, timezone
-
 # Project-specific config — single source of truth
 from config import (
     SMARD_BASE, SMARD_HEADERS, SMARD_REGION, SMARD_RESOLUTION,
-    SMARD_FILTER_NETZLAST, SMARD_FILTER_FORECAST,
-    KAGGLE_END_DATE, SMARD_START_DATE,
-    DE_STATE_CODES, PANDEMIC_START, PANDEMIC_END,
+    SMARD_FILTER_NETZLAST, KAGGLE_END_DATE,
+    DE_STATE_CODES, DE_STATE_POPULATION, PANDEMIC_START, PANDEMIC_END,
     WEATHER_VARIABLES, SELECTED_CITIES, CITY_POPULATION,
     BASE_TEMPERATURE_HEATING, BASE_TEMPERATURE_COOLING,
 )
@@ -83,11 +71,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))  # project root → util i
 from util.smard_client import SmardClient
 from util.time_features import TimeFeatureCreator
 from util.openmeteo_client import OpenMeteoClient
+from util.school_holidays import load_school_holiday_dates
 
-# Keep legacy aliases so any code that imports them directly still works
-HEADERS = SMARD_HEADERS
-FILTER_NETZLAST = SMARD_FILTER_NETZLAST
-
+SCHOOL_HOLIDAY_CACHE = (
+    Path(__file__).parent.parent / "data" / "cache" / "school_holidays.json"
+)
 
 def fetch_smard_netzlast(
     in_start_date: str,
@@ -121,8 +109,6 @@ def fetch_smard_netzlast(
 
 # --------- add time based features for the energy demand data ----------
 
-import holidays
-
 # rename the time column to 'time' for consistency across datasets
 def rename_time_column(in_df):
     known_time_cols = ('time', 'timestamp', 'DateUTC')
@@ -132,22 +118,33 @@ def rename_time_column(in_df):
             break
     return in_df
 
-# Keep module-level aliases so any code that imports them directly still works
-pandemic_start = PANDEMIC_START
-pandemic_end   = PANDEMIC_END
-
 def holiday_ratio(date):
     '''Fraction of German states with a public holiday on date (delegates to TimeFeatureCreator).'''
-    _tfc = TimeFeatureCreator(country='DE', state_codes=DE_STATE_CODES)
+    _tfc = TimeFeatureCreator(
+        country='DE', state_codes=DE_STATE_CODES,
+        state_weights=DE_STATE_POPULATION,
+    )
     return _tfc.holiday_ratio(date)
 
 def create_time_based_features(in_df, in_year, time_column='time',
+                               in_state_codes=DE_STATE_CODES,
+                               in_state_weights=DE_STATE_POPULATION,
+                               in_school_holiday_dates=None,
                                in_pandemic_start=PANDEMIC_START,
                                in_pandemic_end=PANDEMIC_END):
     '''Create time-based features. Delegates to TimeFeatureCreator (util/time_features.py).'''
+    if in_school_holiday_dates is None:
+        min_year = int(in_df[time_column].dt.year.min())
+        in_school_holiday_dates = load_school_holiday_dates(
+            list(in_state_codes),
+            list(range(min_year, int(in_year) + 1)),
+            SCHOOL_HOLIDAY_CACHE,
+        )
     tfc = TimeFeatureCreator(
         country='DE',
-        state_codes=DE_STATE_CODES,
+        state_codes=in_state_codes,
+        state_weights=in_state_weights,
+        school_holiday_dates=in_school_holiday_dates,
         pandemic_start=in_pandemic_start,
         pandemic_end=in_pandemic_end,
         time_column=time_column,
@@ -178,38 +175,6 @@ def create_energy_features(in_df):
 
     # drop nan rows after lagging and rolling calculations
     out_df = out_df.dropna()
-
-    return out_df
-
-# =========== prepare energy data for prediction ==============
-
-def prepare_energy_data_for_prediction(prediction_date, history_days=15):
-    '''
-    Prepare energy data for prediction: 
-        fetch the energy data from SMARD
-        create time-based features, 
-        and return the prepared DataFrame.
-    '''
-    # for prediction, we need to fetch the most recent energy data to create lagged features, since the Kaggle dataset only goes up to 2025-09-30
-    start_date, end_date = get_start_end_date(prediction_date, history_days)
-    #print('\n---- debugging output of prepare_energy_data_for_prediction ----')
-    #print(start_date, end_date)
-    
-    out_df = fetch_smard_netzlast(start_date, end_date)
-    #print('\nfetched from smard', out_df['time'].head(3))
-    
-    out_df = create_energy_features(out_df)
-    #print('\nafter creating energy features', out_df['time'].head(3))
-
-    # bug 2 corrected
-    # create time hourly of end_date+1 features for the future prediction date, since the lagged features will be based on the past 24h and 168h of energy demand, we need to have at least 168h of energy data up to the day before the prediction date
-    time_24h_after_end_date = pd.date_range(end_date, periods=24, freq='h').tz_localize("Europe/Berlin", nonexistent='shift_forward', ambiguous='infer') + pd.Timedelta(hours=24)
-    out_df = out_df.sort_values('time').tail(24)
-    out_df['time'] = time_24h_after_end_date
-    #print('\nafter creating future time rows head:', out_df['time'].head(3))
-    #print('\n---- end of debugging output of prepare_energy_data_for_prediction ----\n')
-
-    out_df = create_time_based_features(out_df, in_year=pd.to_datetime(end_date).year)
 
     return out_df
 
@@ -435,121 +400,4 @@ def prepare_data_for_modeling():
 
     return out_df
 
-# =========== prepare historical data for prediction and compare with actual data ============
-
-def prepare_historical_data_for_prediction(prediction_date, history_days=15):
-    '''
-    Prepare historical data for prediction and compare with actual data: 
-        fetch the energy data from SMARD for the past history_days, 
-        create time-based features, and return the prepared DataFrame along with the actual energy demand for the prediction date.
-    '''
-    start_date, _ = get_start_end_date(prediction_date, history_days)
-    # Include prediction_date itself so features (lag, rolling) are generated for that day.
-    # get_start_end_date returns end_date = prediction_date - 1, which would exclude it.
-    end_date = prediction_date
-    df_energy = fetch_smard_netzlast(start_date, end_date)
-    df_energy = create_time_based_features(df_energy, in_year=pd.to_datetime(prediction_date).year)
-    df_energy = create_energy_features(df_energy)
-
-    df_weather = prepare_weather_data(in_start_date=start_date, in_end_date=end_date)
-    out_df = combine_energy_weather_dataset(df_energy, df_weather)
-    out_df = out_df.sort_values('time').reset_index(drop=True)
-
-    # Snap start to next clean midnight: lag/rolling dropna may leave a partial first day
-    # (e.g. SMARD UTC→Berlin conversion shifts the series start to 23:00 instead of 00:00)
-    first_row = out_df['time'].iloc[0]
-    if first_row.hour != 0 or first_row.minute != 0:
-        next_midnight = (first_row + pd.Timedelta(days=1)).normalize()
-        out_df = out_df[out_df['time'] >= next_midnight].reset_index(drop=True)
-
-    # use only the predictors 
-    out_df = out_df.drop(columns=['EnergyDemand'], errors='ignore')
-    
-    return out_df
-
-
-# ============= prepare future features for prediction ============ 
-
-def get_start_end_date(prediction_date, history_days=15):
-    # Need at least 168h (7 days) of history for lag/rolling features + buffer
-    start_date = (pd.to_datetime(prediction_date).tz_localize("Europe/Berlin") - pd.Timedelta(days=history_days)).strftime("%Y-%m-%d")
-    end_date   = (pd.to_datetime(prediction_date).tz_localize("Europe/Berlin") - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    return start_date, end_date
-
-
-def create_tomorrow_time(prediction_date):
-    pred_start = pd.Timestamp(prediction_date, tz="Europe/Berlin")
-    future_times = pd.date_range(pred_start, periods=24, freq="h")
-
-    #print(f'Appending future energy rows for prediction date {prediction_date}, future times: {future_times[0]} to {future_times[-1]}')
-
-    return  future_times
-    #(pd.concat([df_energy, df_future], ignore_index=True).sort_values("time").reset_index(drop=True)
-
-def prepare_for_prediction_tomorrow(prediction_date, history_days=15):
-    '''
-    Prepare the dataset for predicting tomorrow's energy demand:
-        fetch the most recent energy data from SMARD to create lagged features, 
-        create time-based features, fetch forecast weather data, and combine them into a single DataFrame for prediction.
-    '''
-    start_date, end_date = get_start_end_date(prediction_date, history_days)
-
-    df_history = fetch_smard_netzlast(start_date, end_date)
-    df_history = df_history.sort_values('time').reset_index(drop=True)
-
-    # Build energy lag features via direct timestamp lookup instead of shift(24)+tail(24).
-    # The tail(24) approach was wrong in two ways:
-    #   1. shift(24) on history rows gives lag values 24h too old once times are relabeled.
-    #   2. If SMARD only has partial data for today (publication delay), tail(24) straddles
-    #      two partial days, causing a visible ~12h pattern shift.
-    energy_idx = df_history.set_index('time')['EnergyDemand']
-
-    def _get(t):
-        # Fall back to same hour last week if the exact timestamp is not yet published by SMARD
-        v = energy_idx.get(t, np.nan)
-        if pd.isna(v):
-            v = energy_idx.get(t - pd.Timedelta(hours=168), np.nan)
-        return v
-
-    def _rolling_mean(t, n):
-        # Matches training: EnergyDemand.shift(24).rolling(n).mean() at prediction time T
-        # = mean of EnergyDemand from T-(n+23)h to T-24h  (n consecutive hours)
-        window = energy_idx.loc[
-            (energy_idx.index >= t - pd.Timedelta(hours=n + 23)) &
-            (energy_idx.index <= t - pd.Timedelta(hours=24))
-        ]
-        return window.mean() if len(window) > 0 else np.nan
-
-    future_times = create_tomorrow_time(prediction_date)
-
-    df_energy = pd.DataFrame({
-        'time':                           future_times,
-        'EnergyDemand_lag_24h':           [_get(t - pd.Timedelta(hours=24))  for t in future_times],
-        'EnergyDemand_lag_168h':          [_get(t - pd.Timedelta(hours=168)) for t in future_times],
-        'EnergyDemand_rolling_mean_24h':  [_rolling_mean(t, 24)              for t in future_times],
-        'EnergyDemand_rolling_mean_168h': [_rolling_mean(t, 168)             for t in future_times],
-    })
-
-    df_energy = create_time_based_features(
-        df_energy,
-        in_year=pd.to_datetime(prediction_date).year
-    )
-
-    pred_start = pd.Timestamp(prediction_date, tz="Europe/Berlin")
-    pred_end   = pred_start + pd.Timedelta(days=1)
-
-    df_energy = df_energy[
-        (df_energy["time"] >= pred_start) &
-        (df_energy["time"] < pred_end)
-    ].copy()
-
-    df_weather = prepare_weather_for_prediction(prediction_date)
-    df_weather = df_weather[
-        (df_weather["time"] >= pred_start) &
-        (df_weather["time"] < pred_end)
-    ].copy()
-
-    out_df = combine_energy_weather_dataset(df_energy, df_weather)
-
-    return out_df.drop(columns=["EnergyDemand"], errors="ignore")
 

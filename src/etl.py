@@ -41,6 +41,8 @@ ROOT_DIR = SRC_DIR.parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from prediction_store import ensure_prediction_table
+
 from fetch_prepare_data import (
     fetch_smard_netzlast,
     prepare_weather_data,
@@ -67,6 +69,7 @@ KAGGLE_RAW_PATH  = ROOT_DIR / "data" / "raw" / "MHLV_2019_2025_combined.csv"
 
 DB_DIR          = ROOT_DIR / "db"
 DEFAULT_DB_PATH = DB_DIR / "energy_demand.db"
+CALENDAR_FEATURE_VERSION = "2"
 
 # Context rows needed to compute lag/rolling features at the seam during incremental updates
 ENERGY_CONTEXT_ROWS  = 168   # lag_168h is the deepest lookback
@@ -88,6 +91,8 @@ CREATE TABLE IF NOT EXISTS energy_demand (
     is_weekend                      INTEGER,
     is_holiday                      INTEGER,
     holiday_ratio                   REAL,
+    is_school_holiday               INTEGER,
+    school_holiday_ratio            REAL,
     is_workday                      INTEGER,
     is_bridge_day                   INTEGER,
     holiday_weight                  REAL,
@@ -116,8 +121,15 @@ CREATE TABLE IF NOT EXISTS weather (
 )
 """
 
+_CREATE_ETL_METADATA_TABLE = """
+CREATE TABLE IF NOT EXISTS etl_metadata (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+"""
+
 _CREATE_COMBINED_VIEW = """
-CREATE VIEW IF NOT EXISTS energy_weather_combined AS
+CREATE VIEW energy_weather_combined AS
 SELECT
     e.time,
     e.energy_demand_mwh,
@@ -125,6 +137,7 @@ SELECT
     e.data_source,
     e.year, e.hour, e.weekday, e.month,
     e.is_weekend, e.is_holiday, e.holiday_ratio,
+    e.is_school_holiday, e.school_holiday_ratio,
     e.is_workday, e.is_bridge_day, e.holiday_weight, e.is_pandemic_time,
     e.energy_demand_lag_24h, e.energy_demand_lag_168h,
     e.energy_demand_rolling_mean_24h, e.energy_demand_rolling_mean_168h,
@@ -140,6 +153,7 @@ _ENERGY_DB_COLS = [
     'time', 'energy_demand_mwh', 'smard_forecast_mwh', 'data_source',
     'year', 'hour', 'weekday', 'month',
     'is_weekend', 'is_holiday', 'holiday_ratio',
+    'is_school_holiday', 'school_holiday_ratio',
     'is_workday', 'is_bridge_day', 'holiday_weight', 'is_pandemic_time',
     'energy_demand_lag_24h', 'energy_demand_lag_168h',
     'energy_demand_rolling_mean_24h', 'energy_demand_rolling_mean_168h',
@@ -168,6 +182,20 @@ def create_database(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     cur = conn.cursor()
     cur.execute(_CREATE_ENERGY_TABLE)
     cur.execute(_CREATE_WEATHER_TABLE)
+    cur.execute(_CREATE_ETL_METADATA_TABLE)
+    existing_energy_cols = {
+        row[1] for row in cur.execute("PRAGMA table_info(energy_demand)")
+    }
+    for column, sql_type in (
+        ('is_school_holiday', 'INTEGER'),
+        ('school_holiday_ratio', 'REAL'),
+    ):
+        if column not in existing_energy_cols:
+            cur.execute(
+                f'ALTER TABLE energy_demand ADD COLUMN {column} {sql_type}'
+            )
+    ensure_prediction_table(conn)
+    cur.execute("DROP VIEW IF EXISTS energy_weather_combined")
     try:
         cur.execute(_CREATE_COMBINED_VIEW)
     except sqlite3.OperationalError:
@@ -175,6 +203,61 @@ def create_database(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn.commit()
     print(f"Database ready: {db_path}")
     return conn
+
+
+def backfill_calendar_features(
+    conn: sqlite3.Connection,
+    school_holiday_dates: dict | None = None,
+    force: bool = False,
+) -> int:
+    """Backfill population-weighted holiday features once per feature version."""
+    version_row = conn.execute(
+        "SELECT value FROM etl_metadata WHERE key = 'calendar_feature_version'"
+    ).fetchone()
+    if not force and version_row and version_row[0] == CALENDAR_FEATURE_VERSION:
+        return 0
+
+    times = pd.read_sql("SELECT time FROM energy_demand ORDER BY time", conn)
+    if times.empty:
+        return 0
+
+    db_times = times['time'].copy()
+    times = _parse_time_col(times)
+    parsed_years = times['time'].dt.year
+    features = create_time_based_features(
+        times,
+        in_year=int(parsed_years.max()),
+        in_school_holiday_dates=school_holiday_dates,
+    )
+    updates = list(
+        features.assign(db_time=db_times)[[
+            'holiday_ratio',
+            'is_school_holiday',
+            'school_holiday_ratio',
+            'db_time',
+        ]].itertuples(index=False, name=None)
+    )
+    with conn:
+        conn.executemany(
+            """
+            UPDATE energy_demand
+            SET holiday_ratio = ?,
+                is_school_holiday = ?,
+                school_holiday_ratio = ?
+            WHERE time = ?
+            """,
+            updates,
+        )
+        conn.execute(
+            """
+            INSERT INTO etl_metadata (key, value)
+            VALUES ('calendar_feature_version', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (CALENDAR_FEATURE_VERSION,),
+        )
+    print(f"Backfilled calendar features: {len(updates)} rows")
+    return len(updates)
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +632,8 @@ def update_database(db_path: Path = DEFAULT_DB_PATH) -> None:
         else:
             print("\n[Energy] Up to date — nothing to do.")
 
+        backfill_calendar_features(conn)
+
         # --- Weather ---
         if status['weather']['rows'] == 0:
             print("\n[Weather] First run — seeding table...")
@@ -626,92 +711,63 @@ def _build_query(base: str, start_date: str, end_date: str) -> tuple:
 
 def prepare_for_prediction_tomorrow_etl(
     prediction_date: str,
+    model,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> pd.DataFrame:
+    """Build tomorrow's features after recursively forecasting the current day.
+
+    Actual demand is loaded only from before D-1. The selected model predicts
+    D-1 hour by hour; these intermediate predictions are then used to construct
+    the energy features for target day D.
     """
-    Build the feature matrix for tomorrow's hourly prediction using the ETL pipeline.
+    from fetch_prepare_data import prepare_weather_for_prediction
+    from walk_forward import build_recursive_forecast_features
 
-    Energy lag context is loaded from the SQLite DB (last 168 rows of energy_demand_mwh)
-    instead of fetching from the SMARD API.  Weather forecast is still fetched live from
-    the Open-Meteo API because tomorrow's weather is not yet in the DB.
+    target_start = pd.Timestamp(prediction_date, tz='Europe/Berlin')
+    target_end = target_start + pd.DateOffset(days=1)
+    forecast_origin = target_start - pd.DateOffset(days=1)
 
-    Column names follow the ETL DB schema (``energy_demand_lag_24h`` etc.), so no
-    renaming is required before passing to the ETL-trained models.
-
-    Parameters
-    ----------
-    prediction_date : str
-        ISO date string for the day to predict, e.g. ``'2026-05-23'``.
-    db_path : Path
-        Path to the SQLite database (default: ``DEFAULT_DB_PATH``).
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per hour of ``prediction_date`` with all feature columns required
-        by the ETL-trained models.
-    """
-    import numpy as np
-    from fetch_prepare_data import (
-        prepare_weather_for_prediction,
-        create_tomorrow_time,
-    )
-
-    # 1. Load energy context from DB — last 168 rows cover the deepest lag (168 h)
     conn = sqlite3.connect(db_path)
     try:
         df_ctx = pd.read_sql(
-            "SELECT time, energy_demand_mwh FROM energy_demand ORDER BY time DESC LIMIT 168",
+            """
+            SELECT time, energy_demand_mwh FROM energy_demand
+            WHERE time < ? ORDER BY time DESC LIMIT 168
+            """,
             conn,
+            params=[forecast_origin.strftime('%Y-%m-%dT%H:%M:%S%z')],
         )
     finally:
         conn.close()
 
-    df_ctx     = _parse_time_col(df_ctx)
-    energy_idx = df_ctx.set_index('time')['energy_demand_mwh']
+    history = (
+        _parse_time_col(df_ctx).sort_values('time')
+        .set_index('time')['energy_demand_mwh']
+    )
+    if len(history.dropna()) < 168:
+        raise ValueError('Insufficient demand history for recursive prediction')
 
-    # 2. Build lag / rolling features for each hour of tomorrow
-    def _get(t):
-        v = energy_idx.get(t, np.nan)
-        if pd.isna(v):                                          # fall back to same hour last week
-            v = energy_idx.get(t - pd.Timedelta(hours=168), np.nan)
-        return v
-
-    def _rolling_mean(t, n):
-        window = energy_idx.loc[
-            (energy_idx.index >= t - pd.Timedelta(hours=n + 23)) &
-            (energy_idx.index <= t - pd.Timedelta(hours=24))
-        ]
-        return window.mean() if len(window) > 0 else np.nan
-
-    future_times = create_tomorrow_time(prediction_date)
-
-    df_energy = pd.DataFrame({
-        'time':                            future_times,
-        'energy_demand_lag_24h':           [_get(t - pd.Timedelta(hours=24))  for t in future_times],
-        'energy_demand_lag_168h':          [_get(t - pd.Timedelta(hours=168)) for t in future_times],
-        'energy_demand_rolling_mean_24h':  [_rolling_mean(t, 24)              for t in future_times],
-        'energy_demand_rolling_mean_168h': [_rolling_mean(t, 168)             for t in future_times],
-    })
-
-    df_energy = create_time_based_features(
-        df_energy, in_year=pd.to_datetime(prediction_date).year
+    horizon_time = pd.date_range(
+        forecast_origin, target_end, freq='h', inclusive='left'
+    )
+    df_time = create_time_based_features(
+        pd.DataFrame({'time': horizon_time}), in_year=target_start.year
     )
 
-    pred_start = pd.Timestamp(prediction_date, tz='Europe/Berlin')
-    pred_end   = pred_start + pd.Timedelta(days=1)
-    df_energy  = df_energy[
-        (df_energy['time'] >= pred_start) & (df_energy['time'] < pred_end)
-    ].copy()
-
-    # 3. Fetch tomorrow's weather forecast live from Open-Meteo API
     df_weather = prepare_weather_for_prediction(prediction_date)
     df_weather = df_weather[
-        (df_weather['time'] >= pred_start) & (df_weather['time'] < pred_end)
+        (df_weather['time'] >= forecast_origin) & (df_weather['time'] < target_end)
     ].copy()
+    source = pd.merge(df_time, df_weather, on='time', how='inner')
+    if len(source) != len(horizon_time):
+        raise ValueError(
+            f'Incomplete weather horizon: expected {len(horizon_time)} rows, '
+            f'got {len(source)}'
+        )
 
-    # 4. Merge on timestamp
-    return pd.merge(df_energy, df_weather, on='time', how='inner')
+    return build_recursive_forecast_features(
+        model, source, history, target_start
+    )
 
 
 # ---------------------------------------------------------------------------

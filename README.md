@@ -11,31 +11,20 @@ Portfolio-Projekt zur stündlichen Vorhersage des deutschen Stromverbrauchs auf 
 - **Tagesvorhersage**: Stündliche ML-Prognose für den nächsten Tag (00:00–23:00 Europe/Berlin), verglichen mit der offiziellen SMARD-Prognose
 - **Historischer Vergleich**: Tatsächlicher Verbrauch vs. SMARD-Prognose vs. ML-Vorhersage für einen frei wählbaren Zeitraum (bis 1 Jahr) — inkl. MAE und RMSE
 - **ETL-Pipeline**: Inkrementelles SQLite-Datenbank-Update (`etl.py`), das Kaggle-CSV, SMARD-API und Open-Meteo-API kombiniert und alle Features vorberechnet — Basis für schnelle historische Abfragen ohne Live-API-Aufrufe
-- **Modelle**: LightGBM, LightGBM_conservative, XGBoost und XGBoost_conservative — je zwei Varianten: legacy (CSV/API) und ETL (DB-basiert), trainiert auf 2019–2024, evaluiert auf 2025
-- LightGBM_conservative und XGBoost_conservative streben bis zu 5 % Unterschätzung an, führen jedoch zu mehr Überschätzung — analog zur asymmetrischen SMARD-Prognosestrategie.
+- **Modelle**: LightGBM und XGBoost — DB-basiert trainiert auf 2019–2024 und per Walk-Forward evaluiert
 
 ---
 
-## Quick Start – Streamlit Apps
+## Quick Start – Streamlit App
 
 Voraussetzung: virtuelle Umgebung aktiviert, trainierte Modelle liegen unter `models/`.
 
-### Legacy App (API-basiert)
+### ETL App
 
 ```powershell
 cd d:\Projects\DataScience\Portfolio\electricity_demand_forecast\workspace_energy_demand
 .venv\Scripts\Activate.ps1
-streamlit run src/streamlit_app.py
-```
-
-Browser öffnet sich unter **http://localhost:8501**.
-
-### ETL App (SQLite-DB-basiert, empfohlen)
-
-```powershell
-cd d:\Projects\DataScience\Portfolio\electricity_demand_forecast\workspace_energy_demand
-.venv\Scripts\Activate.ps1
-streamlit run src/streamlit_app_etl.py
+python -m streamlit run src/streamlit_app_etl.py
 ```
 
 Browser öffnet sich unter **http://localhost:8501** (oder Port 8502 bei gleichzeitigem Betrieb).
@@ -44,53 +33,58 @@ Beim ersten Start führt die App `update_database()` aus und befüllt/aktualisie
 
 | Tab | Funktion |
 |---|---|
-| 🔮 Vorhersage (morgen) | Energie-Lag-Kontext aus DB + Open-Meteo Wetter-Forecast → ML-Prognose für morgen inkl. SMARD-Vergleichslinie |
-| 📊 Historischer Vergleich | Actual / SMARD / ML aus **einem einzigen DB-Query** — kein Live-API-Abruf, max. 1 Jahr, mit MAE + RMSE |
-
-### Vergleich: Legacy vs. ETL
-
-| Aspekt | Legacy (`streamlit_app.py`) | ETL (`streamlit_app_etl.py`) |
-|---|---|---|
-| Modelle | `*_bayesian.pkl` | `*_bayesian_etl.pkl` |
-| Morgen-Energie-Lag | SMARD API (re-fetch) | SQLite DB (letzte 168 Zeilen) |
-| Historische Daten | 3 API-Aufrufe + Feature-Berechnung | 1 SQL-Query |
-| Spaltenbenennung | `EnergyDemand_lag_*` | `energy_demand_lag_*` (DB-Schema) |
+| Vorhersage (morgen) | Energie-Lag-Kontext aus DB + Open-Meteo Wetter-Forecast → ML-Prognose für morgen inkl. SMARD-Vergleichslinie |
+| Historischer Vergleich | DB-Quelldaten → Walk-Forward → CSV-Checkpoint → SQLite-Prognosetabelle; kein Live-API-Abruf, max. 1 Jahr, mit MAE + RMSE |
 
 ---
 
 ## Interaktive Notebooks
 
-Neben den Streamlit-Apps stehen zwei interaktive Jupyter-Notebooks bereit (in `notebook/`):
+Als interaktive Oberfläche steht zusätzlich Notebook 08 in `notebook/` bereit:
 
 | Notebook | Art | Beschreibung |
 |---|---|---|
-| `08_interactive_prediction.ipynb` | Legacy (API-basiert) | Tagesvorhersage + historischer 3-Kurven-Vergleich; alle Daten werden live von SMARD / Open-Meteo abgerufen |
-| `11_interactive_prediction_etl.ipynb` | ETL (DB-basiert, empfohlen) | Energie-Lag-Kontext aus SQLite-DB; historischer Vergleich per Single-SQL-Query — kein Live-API-Abruf |
+| `08_interactive_prediction_etl.ipynb` | ETL | Rekursive Morgenprognose und historischer Walk-Forward-Vergleich mit CSV-/DB-Persistenz |
 
-### Notebook 11 — Aufbau
+### Notebook 08 — Aufbau
 
 **Teil 1 — Tagesvorhersage (morgen)**
-- Energie-Lag-Kontext wird aus der SQLite-DB geladen (letzte 168 Zeilen, kein SMARD-API-Aufruf)
+- Energie-Lag-Kontext wird bis vor Beginn des heutigen Tages aus SQLite geladen
+- Der heutige Tag wird rekursiv prognostiziert und als Kontext für morgen verwendet
 - Wetter-Forecast wird live von der Open-Meteo API abgerufen
 - Spaltennamen entsprechen bereits dem ETL-DB-Schema — kein Umbenennen nötig
 - Ergebnis: Liniengrafik + stündliche Wertetabelle nebeneinander; SMARD-Tagesprognose als Vergleichslinie (sofern veröffentlicht)
 
 **Teil 2 — Historischer Vergleich (Actual vs. SMARD vs. ML)**
-- Einzelner DB-Query lädt Features, Istwert (`energy_demand_mwh`) und SMARD-Prognose (`smard_forecast_mwh`) in einem Schritt
-- Kein erneuter API-Abruf, kein erneutes Feature-Engineering — deutlich schneller als die Legacy-Version
+- Quelldaten werden aus SQLite geladen; fehlende Walk-Forward-Tage werden berechnet
+- Jeder vollständige Tag wird sofort als CSV gesichert und anschließend in SQLite persistiert
 - Auswählbarer Zeitraum bis maximal 1 Jahr; Live-Validierung verhindert ungültige Auswahl
 - Metriktabelle (MAE, RMSE, Datenpunkte) für ML-Prognose **und** SMARD-Prognose im Vergleich
 
-### Vergleich: Notebook 08 vs. Notebook 11
+### Reproduzierbarer Projektstart
 
-| Aspekt | 08 (Legacy) | 11 (ETL) |
-|---|---|---|
-| Modelle | `*_bayesian.pkl` | `*_bayesian_etl.pkl` |
-| Historische Features | Re-fetch + Re-Berechnung | SQLite DB (vorberechnet) |
-| Historischer Istwert | SMARD API (Filter 410) | DB `energy_demand_mwh` |
-| SMARD-Prognose (hist.) | SMARD API (Filter 411) | DB `smard_forecast_mwh` |
-| Energie-Lag (morgen) | SMARD API (re-fetch) | SQLite DB (letzte 168 Zeilen) |
-| Spaltenbenennung | `EnergyDemand_lag_*` | `energy_demand_lag_*` (DB-Schema) |
+Da Rohdaten, Datenbank und Modellartefakte nicht im Git-Repository liegen:
+
+Nach Änderungen an Kalenderfeatures zuerst die ETL-Pipeline ausführen. Sie migriert
+das Schema und führt den versionierten historischen Backfill aus. Anschließend die
+Modelle mit `06_ml_pipeline_etl.ipynb` neu trainieren. Bereits persistierte
+Walk-Forward-Prognosen stammen noch vom alten Modell und müssen vor einer neuen
+Evaluation bewusst aus CSV und Datenbank entfernt werden.
+
+1. Rohdaten unter `data/raw/` bereitstellen.
+2. `python -m src.etl` beziehungsweise `python src/etl.py` ausführen, um die DB aufzubauen.
+3. Notebook 06 ausführen, um LightGBM und XGBoost unter `models/` zu erzeugen.
+4. Die Streamlit-App mit `python -m streamlit run src/streamlit_app_etl.py` starten.
+
+### Code-Architektur
+
+| Modul | Verantwortung |
+|---|---|
+| `etl.py` | Quelldaten und Feature-DB |
+| `walk_forward.py` | Rekursive Prognose- und Evaluationslogik |
+| `prediction_store.py` | Persistenz der Walk-Forward-Ergebnisse |
+| `forecast_service.py` | Gemeinsame Anwendungslogik für Streamlit und Notebook 08 |
+| `streamlit_app_etl.py` | Darstellung und Benutzerinteraktion |
 
 
 ---
@@ -126,8 +120,8 @@ Die orginal Daten sind bereinigt, aggregiert und transformiert für Machine Lear
 - **Demand-Lag-Features** (`lag_168h`, `lag_24h`) sind die stärksten Prädiktoren — deutlich wirksamer als Kalender-Integer-Features allein
 - Baumbasierte Modelle (LightGBM, XGBoost) übertreffen lineare Modelle klar
 - Industrieller Verbrauch (~40% der Netzlast) wird durch Wetterdaten nicht abgebildet — größte verbleibende Fehlerquelle
-- Feiertags- und Brückentag-Features (`holiday_ratio`, `is_bridge_day`, `holiday_weight`) verbessern die Vorhersage an Ausnahmetagen spürbar
-- SMARD offizielle Prognose (Filter 411) dient als starker Benchmark; das ML-Modell kommt ihr nah ohne Zugang zu internen Netzbetreiber-Daten. Diese benutzt vermutlich Asymmetrische Verlustfunktionen und Quantilregression um die Unterschätzung zu mininieren. Diese werden auch in den LightGBM_conservative und XGBoost_conservative umgesetzt. 
+- Feiertags- und Schulferienquoten werden nach der Bevölkerung der betroffenen Bundesländer gewichtet; Brückentage und `holiday_weight` ergänzen diese Ausnahmetage
+- Die offizielle SMARD-Prognose (Filter 411) dient als starker Benchmark. Eine Analyse in Notebook 07 zeigte jedoch keine konservative Prognosestrategie: SMARD unterschätzte im untersuchten Zeitraum häufiger, als es überschätzte. Separate Quantilmodelle wurden deshalb aus der produktiven Pipeline entfernt, da ihre geringere Unterschätzungsrate mit deutlich schlechterer MAE und starkem positivem Bias erkauft wurde.
 
 ---
 

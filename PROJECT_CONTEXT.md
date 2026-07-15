@@ -16,6 +16,7 @@
 db/energy_demand.db
 ├── energy_demand   (64 576 Zeilen, max: 2026-05-21)
 ├── weather         (64 729 Zeilen, max: 2026-05-22)
+├── walk_forward_predictions  (persistierte historische ML-Prognosen)
 └── energy_weather_combined  (VIEW — JOIN beider Tabellen)
 ```
 
@@ -62,7 +63,9 @@ Die DB verwendet snake_case statt PascalCase:
 | `load_energy_data(conn)` | Energietabelle als DataFrame |
 | `load_weather_data(conn)` | Wettertabelle als DataFrame |
 | `load_combined_data(conn, start_date, end_date)` | View mit optionalem Datumsfilter |
-| `prepare_for_prediction_tomorrow_etl(date, db_path)` | Feature-Matrix für Morgen: Energie-Lag aus DB + Open-Meteo Wetter-Forecast |
+| `prepare_for_prediction_tomorrow_etl(date, model, db_path)` | Prognostiziert zuerst rekursiv den fehlenden heutigen Tag und erzeugt daraus die Feature-Matrix für morgen |
+| `prediction_store.upsert_predictions(conn, predictions)` | CSV-Ergebnisse idempotent in SQLite speichern |
+| `prediction_store.load_predictions(...)` | Persistierte Walk-Forward-Prognosen nach Modell, Modus und Zeitraum laden |
 
 ---
 
@@ -93,7 +96,7 @@ Lizenzhinweis:
 Filter-ID 410: Realisierter Stromverbrauch – Netzlast  
 Filter-ID 411: Prognostizierter Stromverbrauch – Netzlast (offizielle SMARD-Tagesvorhersage)  
 Programmatisch abgerufen über `fetch_smard_netzlast(filter_id=...)` in `src/fetch_prepare_data.py`.  
-Filter 411 wird in Notebook 08 für den 3-Kurven-Vergleich und als Referenz-Benchmark verwendet.
+Filter 411 wird in Streamlit und Notebook 08 als Referenz-Benchmark verwendet.
 
 > **Hinweis Timezone**: SMARD liefert Timestamps in CET/CEST. Die Kaggle-Quelldaten enthalten ebenfalls UTC-Zeitstempel (`DateUTC`). Open-Meteo gibt mit `&timezone=auto` lokale Zeit zurück (CEST im Sommer +2h, CET im Winter +1h) — potenzielle 1h-Verschiebung zwischen Wetter- und Verbrauchsdaten im Sommer.
 
@@ -138,9 +141,16 @@ Aggregation über Top-5-Städte Deutschland (gewichtet nach Stadtbevölkerung):
 **python-holidays**  
 ([holidays.readthedocs.io](https://holidays.readthedocs.io/))
 
+Schulferien werden bundeslandweise über die Ferien-API
+(`https://ferien-api.de/api/v1/holidays/{state}/{year}`) geladen und dauerhaft in
+`data/cache/school_holidays.json` zwischengespeichert. Die Bevölkerungsgewichte
+stehen zentral in `src/config.py` und müssen gemeinsam aktualisiert werden.
+
 Features:
 - `is_holiday` — nationaler/regionaler Feiertag (0/1)
-- `holiday_ratio` — Anteil der Bundesländer mit Feiertag (0–1)
+- `holiday_ratio` — Bevölkerungsanteil der Bundesländer mit Feiertag (0–1)
+- `is_school_holiday` — 1, wenn in mindestens einem Bundesland Schulferien sind
+- `school_holiday_ratio` — Bevölkerungsanteil der Bundesländer mit Schulferien (0–1)
 
 ---
 
@@ -160,7 +170,9 @@ Features:
 | Feature | Beschreibung |
 |---|---|
 | `is_holiday` | Feiertag ja/nein |
-| `holiday_ratio` | Anteil der Bundesländer mit Feiertag (0–1) |
+| `holiday_ratio` | Bevölkerungsanteil der Bundesländer mit Feiertag (0–1) |
+| `is_school_holiday` | 1, wenn mindestens ein Bundesland Schulferien hat |
+| `school_holiday_ratio` | Bevölkerungsanteil der Bundesländer mit Schulferien (0–1) |
 | `is_workday` | 1 wenn Werktag und kein Feiertag (direktes Signal für Hochlasttage) |
 | `is_bridge_day` | 1 wenn Werktag eingeklemmt zwischen Feiertag und Wochenende |
 | `holiday_weight` | kombiniertes Signal: `max(holiday_ratio, is_weekend × 0.5)` |
@@ -184,7 +196,7 @@ Features:
 
 ### Lag-Features Stromverbrauch (entscheidend für Saisonalität)
 
-**Legacy-Benennung** (in `fetch_prepare_data.py` und Notebooks 01–09):
+**Legacy-Benennung** (in älteren EDA-Notebooks):
 
 | Feature | Beschreibung |
 |---|---|
@@ -193,7 +205,7 @@ Features:
 | `EnergyDemand_rolling_mean_24h` | 24h-Rollmittel Verbrauch (shift(24)) |
 | `EnergyDemand_rolling_mean_168h` | 168h-Rollmittel Verbrauch (shift(24)) |
 
-**ETL-Benennung** (in DB-Schema, `etl.py`, Notebooks 10–11, `streamlit_app_etl.py`):
+**ETL-Benennung** (in DB-Schema, `etl.py`, Notebooks 06–08, `streamlit_app_etl.py`):
 
 | Feature | Beschreibung |
 |---|---|
@@ -209,6 +221,25 @@ Features:
 ---
 
 ## Train/Test Split
+
+### Walk-Forward-Evaluation
+
+Die historische Auswertung der ETL-App verwendet eine rekursive 48-Stunden-
+Simulation. Für einen Zieltag `D` gelten nur Verbrauchswerte vor `D-1` als
+bekannt. Die Stunden von `D-1` werden zuerst prognostiziert und anschließend als
+Lastverlauf für die Prognose von `D` verwendet. Bewertet wird ausschließlich der
+Zieltag `D`.
+
+Vollständig berechnete Tage werden je Modell unter
+`data/walk_forward_predictions/` als CSV zwischengespeichert. Ein erneuter Lauf
+überspringt bereits vollständige Tage. Die CSV-Dateien bleiben erhalten, bis die
+Ergebnisse erfolgreich in `walk_forward_predictions` geschrieben und abgeglichen
+wurden. Auch nach erfolgreichem Abgleich werden die CSV-Dateien nicht automatisch
+gelöscht.
+
+Der Evaluationsmodus heißt `walk_forward_48h_actual_weather`: Das Last-Leakage
+ist ausgeschlossen, historische Wetterfeatures stammen derzeit jedoch aus
+beobachtetem Wetter und nicht aus archivierten Wetterprognosen.
 
 | Split | Zeitraum | Verwendung |
 |---|---|---|
@@ -260,16 +291,13 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 - Standard-k-Fold CV führt bei Lag-Features zu Datenleck → `TimeSeriesSplit` verwenden
 - Zyklische Kodierung (`sin`/`cos`) für `hour` und `month` empfohlen (Integer bilden keine Periodikität ab)
 - Industrieller Verbrauch (~40% der Netzlast) wird durch Wetterdaten nicht abgebildet — größte verbleibende Fehlerquelle
-- **Timezone-Problem (behoben in ETL-App)**: Matplotlib konvertiert tz-aware Timestamps intern nach UTC beim Plotten. In `streamlit_app_etl.py` werden beide Serien (ML + SMARD) über `_strip_tz()` zu tz-naive Europe/Berlin normiert, bevor sie an matplotlib übergeben werden. In `streamlit_app.py` (legacy) werden beide Serien direkt (tz-aware, gleich) übergeben — daher kein Shift.
+- **Timezone-Problem (behoben in ETL-App)**: Matplotlib konvertiert tz-aware Timestamps intern nach UTC beim Plotten. In `streamlit_app_etl.py` werden beide Serien (ML + SMARD) über `_strip_tz()` zu tz-naive Europe/Berlin normiert, bevor sie an matplotlib übergeben werden.
 - **pandas 3.0 Mixed-Timezone-Bug (behoben)**: `pd.to_datetime(col)` wirft `ValueError: Mixed timezones` bei Spalten mit gemischten UTC-Offsets (`+0100`/`+0200`). Fix: `pd.to_datetime(col, utc=True)` in `_parse_time_col` in `etl.py`.
-- Bekannter SMARD-Zeitversatz in Notebook 08: ML-Prognose vs. SMARD-Prognose zeigt ~3h-Shift; Ursache: SMARD liefert Prognosedaten mit anderer Zeitauflösung/Offset im CSV-Export
-- **Bug (behoben): ~12h Musterverzug in Vorhersage-Lag-Features** — der frühere `tail(24)`-Ansatz in `prepare_for_prediction_tomorrow` hatte zwei Fehler: (1) *Grundlegender 24h-Offset*: `create_energy_features(df_history).tail(24)` berechnet `lag_24h` via `shift(24)` relativ zur Listenposition; die letzten 24 Zeilen (z.B. `2026-05-20 00–23 Uhr`) haben dadurch `lag_24h = Verbrauch 2026-05-19`, nicht `2026-05-20`. Nach Umetikettierung auf Vorhersagezeiten `2026-05-21` zeigt das Modell Lag-Werte von 48h statt 24h vor dem Vorhersagezeitpunkt. (2) *SMARD-Teiltag*: wird der Code tagsüber ausgeführt (z.B. 13:00), liefert SMARD den aktuellen Tag nur halb (Publikationsverzug ~1–2h). `tail(24)` greift dann auf 12h von gestern + 12h von heute zurück — zwei halbvolle Tage, die als morgiger Tag umetikettiert werden. Das Ergebnis ist ein ~12h invertiertes Tagesmuster (Mittagshoch erscheint bei Mitternacht). **Fix**: Lag-Features werden jetzt per direktem Zeitstempel-Lookup berechnet (`energy_idx.get(t - 24h)`); für noch nicht von SMARD veröffentlichte Stunden des heutigen Tages greift ein Fallback auf dieselbe Stunde der Vorwoche (`t - 168h`).
+- **Operative Morgenprognose**: Istwerte werden strikt vor D-1 abgeschnitten. D-1 wird stündlich rekursiv prognostiziert und als Kontext für Zieltag D verwendet.
 
 ---
 
 ## Notebook-Übersicht
-
-> Notebooks unter `notebook/` sind die Originalversionen; `notebook_edit/` enthält die aktuellen (editierten) Versionen.
 
 | Notebook | Inhalt |
 |---|---|
@@ -277,21 +305,20 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 | `02_eda_weather.ipynb` | EDA Wetterdaten je Stadt |
 | `03_eda_energy_weather.ipynb` | Feature Engineering, kombinierter Datensatz, Korrelationsanalyse |
 | `04_base_models_eval.ipynb` | Modelltraining, Tuning, Lernkurven, Prediction vs. Actual |
-| `05_feature_importances.ipynb` | Feature Importance Analyse, Entfernung schwacher Features |
-| `06_scrape_smard.ipynb` | SMARD API Scraping für Stromverbrauch ab 2025-10-01 |
-| `07_complete_ml_pipeline.ipynb` | Vollständige ML-Pipeline: Training, Tuning, Persistenz |
-| `08_interactive_prediction.ipynb` | Interaktive Vorhersage (legacy): Tagesvorhersage + historischer 3-Kurven-Vergleich; API-basiert |
-| `09_asymmetric_loss.ipynb` | Asymmetrische Verlustfunktionen und Quantilregression |
-| `10_ml_pipeline_etl.ipynb` | ETL ML-Pipeline: Training der 4 Modellvarianten auf SQLite-DB-Daten; speichert `*_etl.pkl` |
-| `11_interactive_prediction_etl.ipynb` | ETL Interaktive Vorhersage (empfohlen): Energie-Lag-Kontext aus SQLite-DB (kein SMARD-API); historischer Vergleich per Single-SQL-Query; Metriktabelle MAE/RMSE für ML + SMARD |
+| `05_scrape_eda_smard.ipynb` | Historische SMARD-Analyse und Untersuchung des Prognoseverhaltens |
+| `06_ml_pipeline_etl.ipynb` | ETL-Training und Walk-Forward-Evaluation von LightGBM und XGBoost |
+| `07_feature_importances.ipynb` | Feature Importances, Ferienfeature-Analyse und Befunde zu konservativen Prognosen |
+| `08_interactive_prediction_etl.ipynb` | Rekursive Morgenprognose und historischer Walk-Forward-Vergleich mit CSV-/DB-Persistenz |
 
-### Notebook 11 — Implementierungsdetails
+### Notebook 08 — Implementierungsdetails
 
 **Teil 1 — Tagesvorhersage (morgen)**
 
-- `prepare_for_prediction_tomorrow_etl(tomorrow_str)` baut die Feature-Matrix:
-  - Energie-Lag-Kontext: letzte 168 DB-Zeilen (kein SMARD-API-Aufruf)
-  - Wetter-Forecast: live von Open-Meteo API
+- `prepare_for_prediction_tomorrow_etl(tomorrow_str, model)` baut die Feature-Matrix:
+  - Energie-Lag-Kontext: letzte 168 DB-Zeilen vor Beginn des heutigen Tages
+  - der ausgewählte Modellstand prognostiziert den heutigen Tag stündlich rekursiv
+  - die prognostizierten heutigen Lastwerte bilden Lags und Rolling Features für morgen
+  - Wetter-Forecast für heute und morgen: live von Open-Meteo API
   - Spaltennamen entsprechen direkt dem ETL-DB-Schema — kein Umbenennen nötig
 - SMARD-Tagesprognose (Filter 411) wird parallel per API abgerufen und als Vergleichslinie eingeblendet (sofern bereits veröffentlicht)
 - `_render_future`: Liniengrafik (2.5-Anteile) + stündliche Wertetabelle (1-Anteil) nebeneinander
@@ -299,33 +326,23 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 
 **Teil 2 — Historischer Vergleich**
 
-- Einzelner `load_combined_data(conn, start_date, end_date)`-Query liefert Features, Istwert und SMARD-Prognose in einem Schritt
+- Quelldaten inklusive Warm-up-Kontext werden aus SQLite geladen; fehlende Zieltage werden per Walk-Forward berechnet
+- Ergebnisse werden tageweise als CSV gesichert, in SQLite persistiert und beim nächsten Abruf wiederverwendet
 - Zeitraum frei wählbar (min. 2019-01-08, max. 1 Jahr); Live-Validierung über `_validate_range()` sperrt den Compare-Button bei ungültiger Auswahl
 - X-Achsen-Format passt sich automatisch an den gewählten Zeitraum an (≤3 Tage: `%m-%d %H:%M`, ≤31 Tage: `%Y-%m-%d`, sonst: `%Y-%m`)
 - Metriktabelle (MAE, RMSE, Datenpunkte) für ML-Prognose **und** SMARD-Prognose nebeneinander
-
-### Vergleich: Notebook 08 vs. Notebook 11
-
-| Aspekt | 08 (Legacy) | 11 (ETL) |
-|---|---|---|
-| Modelle | `*_bayesian.pkl` | `*_bayesian_etl.pkl` |
-| Historische Features | Re-fetch + Re-Berechnung via API | SQLite DB (vorberechnet) |
-| Historischer Istwert | SMARD API (Filter 410) | DB `energy_demand_mwh` |
-| SMARD-Prognose (hist.) | SMARD API (Filter 411) | DB `smard_forecast_mwh` |
-| Energie-Lag (morgen) | SMARD API (re-fetch) | SQLite DB (letzte 168 Zeilen) |
-| Spaltenbenennung | `EnergyDemand_lag_*` | `energy_demand_lag_*` (DB-Schema, kein Umbenennen) |
-
----
 
 ## Source Code (`/src`)
 
 | Datei | Inhalt |
 |---|---|
-| `fetch_prepare_data.py` | Kaggle/SMARD (Filter 410 + 411)/Open-Meteo Datenabruf, Feature Engineering; `prepare_for_prediction_tomorrow()` für Legacy-Tagesvorhersage |
+| `fetch_prepare_data.py` | Kaggle/SMARD/Open-Meteo Datenabruf und gemeinsames Feature Engineering |
 | `train_model_predict.py` | Modelltraining, Hyperparameter-Tuning, Modell-Persistenz |
 | `etl.py` | ETL-Pipeline: SQLite-DB erstellen/aktualisieren; Read-Helfer (`load_combined_data`, `prepare_for_prediction_tomorrow_etl`) |
-| `streamlit_app.py` | Legacy Web-App (API-basiert, Modelle `*_bayesian.pkl`) |
-| `streamlit_app_etl.py` | ETL Web-App (DB-basiert, Modelle `*_bayesian_etl.pkl`); Tages-Vorhersage mit Energie-Lag aus DB; historischer Vergleich per Single-SQL-Query |
+| `walk_forward.py` | Leakage-sichere rekursive Feature- und Evaluationslogik sowie CSV-Checkpoint |
+| `prediction_store.py` | SQLite-Schema, Upsert und Abfragen für persistierte Prognosen |
+| `forecast_service.py` | Gemeinsame Orchestrierung für Modelle, Morgenprognose, historische Evaluation und Metriken |
+| `streamlit_app_etl.py` | Rekursive Morgenprognose und historischer Walk-Forward-Vergleich |
 
 ---
 
@@ -357,9 +374,9 @@ pd.to_datetime(df["time"], utc=True).dt.tz_convert("Europe/Berlin")
 - Open-Meteo forecast mit timezone=Europe/Berlin
 pd.to_datetime(df["time"]).dt.tz_localize("Europe/Berlin")
 
-### Vorhersage-Lag-Features: Zeitstempel-Lookup
+### Vorhersage-Lag-Features
 
-In `prepare_for_prediction_tomorrow` werden die Energie-Lag-Features nicht mehr über `create_energy_features().tail(24)` + Zeitstempel-Überschreibung berechnet, sondern per direktem Lookup in der SMARD-History.
+Historische Evaluation und operative Morgenprognose verwenden denselben positionsbasierten rekursiven Feature-Builder aus `walk_forward.py`. Dadurch stimmen Lag- und Rolling-Definitionen mit dem Training überein und DST-Tage mit 23 beziehungsweise 25 Stunden bleiben korrekt.
 
 ---
 
@@ -371,19 +388,17 @@ In `prepare_for_prediction_tomorrow` werden die Energie-Lag-Features nicht mehr 
 - [x] EDA Wetterdaten (Notebook 02)
 - [x] Feature Engineering & EDA kombinierter Datensatz (Notebook 03)
 - [x] Baseline- und ML-Modell-Evaluation (Notebook 04)
-- [x] Feature Importances Analyse (Notebook 05)
-- [x] Web Scraping SMARD Stromverbrauch-Daten ab 2025-10-01 (Notebook 06)
+- [x] SMARD-Exploration und Prognoseanalyse (Notebook 05)
+- [x] ETL-Modelltraining und Walk-Forward-Evaluation von LightGBM und XGBoost (Notebook 06)
+- [x] Feature Importances und Ferienfeature-Analyse (Notebook 07)
 - [x] Python Source Refactoring /src (`fetch_prepare_data.py`, `train_model_predict.py`)
-- [x] Vollständige ML-Pipeline: Training, Tuning, Persistenz (Notebook 07)
+- [x] Vollständige ML-Pipeline: Training, Tuning, Persistenz (Notebook 06)
 - [x] Bayesian Hyperparameter-Optimierung mit Optuna auf AI PC
-- [x] Rolling-Features auf `shift(24)` umgestellt (kein Datenleck durch unmittelbar vorangehende Stunden)
-- [x] Interaktives Notebook und Streamlit-App (Notebook 08): Tages-Vorhersage (morgen) + historischer Vergleich (Actual / SMARD / ML)
-- [x] Notebook 08 GUI-Trennung: Tab 1 = Tages-Vorhersage, Tab 2 = historischer Vergleich (max. 1 Jahr, europäischer Kalender)
-- [x] Asymmetrische Verlustfunktionen und Quantilregression (Notebook 09)
-- [x] Bug behoben: `prepare_for_prediction_tomorrow` — Lag-Features via direktem Zeitstempel-Lookup statt `tail(24)`
+- [x] Rolling-Features auf `shift(1).rolling(...)` vereinheitlicht
 - [x] **ETL-Pipeline** (`src/etl.py`): SQLite-DB mit inkrementellem Update; alle Features vorberechnet; Kaggle-CSV + SMARD-API + Open-Meteo-API als Quellen
-- [x] **ETL ML-Pipeline** (Notebook 10): Training der 4 Modellvarianten auf DB-Daten; Modelle mit `_etl`-Suffix gespeichert
-- [x] **ETL Interaktive Vorhersage** (Notebook 11): Energie-Lag-Kontext aus DB statt SMARD-API; historischer Vergleich per Single-SQL-Query
+- [x] **ETL ML-Pipeline** (Notebook 06): Training von LightGBM und XGBoost auf DB-Daten; Modelle mit `_etl`-Suffix gespeichert
+- [x] Konservative Quantilmodelle analysiert und aus der produktiven Pipeline entfernt: geringere Unterschätzungsrate, aber deutlich schlechtere MAE und starker positiver Bias; SMARD zeigte im untersuchten Zeitraum ebenfalls keine konservative Coverage
+- [x] **ETL Interaktive Vorhersage** (Notebook 08): rekursive Morgenprognose und historischer Walk-Forward-Vergleich
 - [x] **ETL Streamlit App** (`src/streamlit_app_etl.py`): DB-basierte Vorhersage-App; SMARD-Zeitversatz-Bug behoben (`_strip_tz` auf beide Serien)
 - [x] Bug behoben: `_parse_time_col` in `etl.py` — `pd.to_datetime(..., utc=True)` für gemischte UTC-Offsets (pandas 3.0)
 

@@ -202,7 +202,7 @@ GET https://www.smard.de/app/table_data/410/DE/410_DE_quarterhour_1546300800000.
 
 The Kaggle dataset (ENTSO-E based) covers **2019-01-01 to 2025-09-30**. SMARD is used to extend the energy demand data from **2025-10-01 onward** for:
 
-- Real-time prediction pipeline (Notebook 08 / `streamlit_app.py`)
+- SMARD benchmark series in Notebook 11 and `streamlit_app_etl.py`
 - Building lag features (`lag_24h`, `lag_168h`) that require recent historical load values
 
 ### Key Functions — `src/fetch_prepare_data.py`

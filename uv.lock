@@ -1711,6 +1711,14 @@ wheels = [
 ]
 
 [[package]]
+name = "trampoline"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/54/d2805324fb746d8da86d3844bee4f55c0cfd6c136de61b713772d44c5bea/trampoline-0.1.2-py3-none-any.whl", hash = "sha256:36cc9a4ff9811843d177fc0e0740efbd7da39eadfe6e50c9e2937cbc06d899d9", size = 5173, upload-time = "2018-08-18T01:00:41.215Z" },
+]
+
+[[package]]
 name = "typing-extensions"
 version = "4.15.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1840,6 +1848,7 @@ dependencies = [
     { name = "shap" },
     { name = "statsmodels" },
     { name = "streamlit" },
+    { name = "trampoline" },
     { name = "xgboost" },
 ]
 
@@ -1867,6 +1876,7 @@ requires-dist = [
     { name = "shap", specifier = ">=0.51.0" },
     { name = "statsmodels", specifier = ">=0.14.6" },
     { name = "streamlit", specifier = ">=1.45.0" },
+    { name = "trampoline", specifier = ">=0.1.2" },
     { name = "xgboost", specifier = ">=3.2.0" },
 ]
 

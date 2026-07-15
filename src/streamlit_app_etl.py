@@ -7,7 +7,7 @@ Two sections:
   2. Historischer Vergleich — features, actuals and SMARD forecast are all
      read from the pre-computed DB view (single SQL query, no live API calls).
 
-Uses the ETL-trained models (*_bayesian_etl.pkl) from notebook 10.
+Uses the ETL-trained LightGBM and XGBoost models from notebook 06.
 
 Run with (from workspace root):
     streamlit run src/streamlit_app_etl.py
@@ -15,6 +15,7 @@ Run with (from workspace root):
 
 import sys
 import os
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,13 +30,18 @@ FILTER_SMARD_FORECAST = 411  # Prognostizierter Stromverbrauch: Netzlast
 MAX_RANGE_DAYS        = 365
 
 from fetch_prepare_data import fetch_smard_netzlast
-from train_model_predict import load_model_from_pickle
 from etl import (
     update_database,
-    get_connection,
-    load_combined_data,
-    prepare_for_prediction_tomorrow_etl,
 )
+from forecast_service import (
+    error_metrics,
+    evaluate_historical_range,
+    forecast_tomorrow,
+    load_project_models,
+)
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+WALK_FORWARD_CSV_DIR = ROOT_DIR / "data" / "walk_forward_predictions"
 
 # ── page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -55,17 +61,7 @@ _init_db()
 # ── load ETL-trained models once (cached across sessions) ─────────────────────
 @st.cache_resource
 def load_models():
-    _base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
-    return {
-        "LGBM":               load_model_from_pickle(
-            os.path.join(_base, "best_lgbm_model_bayesian_etl.pkl")),
-        "LGBM_conservative":  load_model_from_pickle(
-            os.path.join(_base, "best_lgbm_model_bayesian_conservative_etl.pkl")),
-        "XGBoost":            load_model_from_pickle(
-            os.path.join(_base, "best_xgb_model_bayesian_etl.pkl")),
-        "XGBoost_conservative": load_model_from_pickle(
-            os.path.join(_base, "best_xgb_model_bayesian_conservative_etl.pkl")),
-    }
+    return load_project_models(ROOT_DIR / "models")
 
 
 models = load_models()
@@ -158,7 +154,7 @@ tab_future, tab_hist = st.tabs(["🔮 Vorhersage (morgen)", "📊 Historischer V
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — Future Prediction (tomorrow, full day)
-# Energy lag context → loaded from DB (last 168 rows, no SMARD API call)
+# Demand context → actual DB history before today, then recursive today forecast
 # Weather forecast   → fetched live from Open-Meteo API
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_future:
@@ -200,11 +196,13 @@ with tab_future:
             st.success(f"SMARD-Prognose: {len(df_smard_fc)} Stunden abgerufen.")
 
         # 2. Build features via ETL approach ───────────────────────────────────
-        #    Energy lags: loaded from DB (last 168 rows) — no SMARD API call
+        #    Demand: DB cutoff before today + recursive predictions for today
         #    Weather forecast: fetched live from Open-Meteo
         with st.spinner(f"Features werden aus DB vorbereitet für {tomorrow_str} …"):
             try:
-                df_future = prepare_for_prediction_tomorrow_etl(tomorrow_str)
+                df_future, prediction_series = forecast_tomorrow(
+                    models[future_model], tomorrow_str
+                )
             except Exception as exc:
                 st.error(f"Feature-Vorbereitung fehlgeschlagen: {exc}")
                 st.stop()
@@ -215,11 +213,7 @@ with tab_future:
 
         # 3. Predict ───────────────────────────────────────────────────────────
         with st.spinner(f"{future_model} wird ausgeführt …"):
-            X     = df_future.drop(columns=["time"], errors="ignore")
-            model = models[future_model]
-            if hasattr(model, "feature_names_in_"):
-                X = X.reindex(columns=model.feature_names_in_)
-            preds = model.predict(X)
+            preds = prediction_series.to_numpy()
 
         st.success(f"Vorhersage abgeschlossen — {tomorrow_str} ({future_model})")
 
@@ -271,18 +265,24 @@ with tab_future:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — Historical Comparison
-# All data (features, actual demand, SMARD forecast) from a single DB query.
+# Source data comes from the DB; walk-forward predictions are cached as CSV.
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_hist:
+    st.info(
+        "ML-Prognosen werden jetzt als Walk-Forward-Evaluation berechnet: "
+        "Zuerst wird der fehlende Vortag prognostiziert, danach der Zieltag. "
+        "Vollständige Tage werden als CSV zwischengespeichert; historische "
+        "Wetterfeatures stammen weiterhin aus beobachtetem Wetter."
+    )
     st.markdown(
         "Vergleich von tatsächlichem Verbrauch, SMARD-Prognose und ML-Vorhersage.  \n"
-        "**Alle Daten kommen aus der DB** (ein SQL-Query — keine Live-API-Aufrufe).  \n"
+        "Quelldaten kommen aus der DB; ML-Prognosen aus dem CSV-Zwischenspeicher.  \n"
         "Maximaler Zeitraum: **1 Jahr**."
     )
 
     _default_to   = date.today() - timedelta(days=1)
     _default_from = _default_to - timedelta(days=6)
-    _min_date     = date(2019, 1, 8)   # DB starts 2019-01-08 (after lag warm-up)
+    _min_date     = date(2019, 1, 17)  # 168 actual hours required before D-1
     _max_date     = date.today() - timedelta(days=1)
 
     col1, col2, col3 = st.columns(3)
@@ -324,40 +324,15 @@ with tab_hist:
         if st.button("Compare Prediction vs Actual", type="primary", key="btn_compare"):
             from_str = str(date_from)
             to_str   = str(date_to)
+            with st.spinner(f"Walk-Forward wird geladen/berechnet: {from_str} → {to_str} …"):
+                df_plot = evaluate_historical_range(
+                    models[hist_model], hist_model, from_str, to_str,
+                    WALK_FORWARD_CSV_DIR,
+                )
 
-            # 1. Single DB query — features + actual + SMARD forecast ──────────
-            with st.spinner(f"Daten werden aus DB geladen: {from_str} → {to_str} …"):
-                conn = get_connection()
-                try:
-                    df_db = load_combined_data(
-                        conn, start_date=from_str, end_date=to_str
-                    )
-                finally:
-                    conn.close()
-
-            if df_db.empty:
+            if df_plot.empty:
                 st.error(f"Keine Daten in der DB für {from_str} → {to_str}.")
                 st.stop()
-
-            # 2. Extract actual demand and SMARD forecast ──────────────────────
-            s_actual = df_db.set_index("time")["energy_demand_mwh"].rename("Actual")
-            s_smard = (
-                df_db.set_index("time")["smard_forecast_mwh"].rename("SMARD Forecast")
-                if "smard_forecast_mwh" in df_db.columns
-                else pd.Series(dtype=float, name="SMARD Forecast")
-            )
-
-            # 3. Build feature matrix and predict ──────────────────────────────
-            with st.spinner(f"{hist_model} wird ausgeführt …"):
-                _drop = ["time", "energy_demand_mwh", "smard_forecast_mwh", "data_source"]
-                X     = df_db.drop(columns=[c for c in _drop if c in df_db.columns])
-                model = models[hist_model]
-                if hasattr(model, "feature_names_in_"):
-                    X = X.reindex(columns=model.feature_names_in_)
-                preds = model.predict(X)
-
-            s_pred  = pd.Series(preds, index=df_db["time"], name="ML Prediction")
-            df_plot = pd.concat([s_actual, s_smard, s_pred], axis=1)
 
             st.success(f"Vergleich abgeschlossen — {from_str} → {to_str} ({hist_model})")
 
@@ -397,33 +372,23 @@ with tab_hist:
             st.pyplot(fig)
 
             # 5. Metrics ───────────────────────────────────────────────────────
-            df_ml_cmp = df_plot[["Actual", "ML Prediction"]].dropna()
-            mae_ml    = (df_ml_cmp["Actual"] - df_ml_cmp["ML Prediction"]).abs().mean()
-            rmse_ml   = (
-                (df_ml_cmp["Actual"] - df_ml_cmp["ML Prediction"]) ** 2
-            ).mean() ** 0.5
+            ml_metrics = error_metrics(df_plot["Actual"], df_plot["ML Prediction"])
 
             if df_plot["SMARD Forecast"].notna().any():
-                df_sm_cmp  = df_plot[["Actual", "SMARD Forecast"]].dropna()
-                mae_smard  = (
-                    df_sm_cmp["Actual"] - df_sm_cmp["SMARD Forecast"]
-                ).abs().mean()
-                rmse_smard = (
-                    (df_sm_cmp["Actual"] - df_sm_cmp["SMARD Forecast"]) ** 2
-                ).mean() ** 0.5
+                smard_metrics = error_metrics(df_plot["Actual"], df_plot["SMARD Forecast"])
                 _render_metric_comparison(
                     model_name=hist_model,
-                    mae_ml=mae_ml,
-                    rmse_ml=rmse_ml,
-                    ml_points=len(df_ml_cmp),
-                    mae_smard=mae_smard,
-                    rmse_smard=rmse_smard,
-                    smard_points=len(df_sm_cmp),
+                    mae_ml=ml_metrics["mae"],
+                    rmse_ml=ml_metrics["rmse"],
+                    ml_points=ml_metrics["points"],
+                    mae_smard=smard_metrics["mae"],
+                    rmse_smard=smard_metrics["rmse"],
+                    smard_points=smard_metrics["points"],
                 )
             else:
                 _render_metric_comparison(
                     model_name=hist_model,
-                    mae_ml=mae_ml,
-                    rmse_ml=rmse_ml,
-                    ml_points=len(df_ml_cmp),
+                    mae_ml=ml_metrics["mae"],
+                    rmse_ml=ml_metrics["rmse"],
+                    ml_points=ml_metrics["points"],
                 )

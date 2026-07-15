@@ -33,6 +33,28 @@ DE_STATE_CODES = [
     'SL', 'SN', 'ST', 'TH',
 ]
 
+# Population weights by federal state (Destatis population level, rounded).
+# Absolute values are used only as relative weights and should be refreshed
+# together when a newer reference year is adopted.
+DE_STATE_POPULATION = {
+    'BW': 11_339_000,
+    'BY': 13_435_000,
+    'BE':  3_878_000,
+    'BB':  2_582_000,
+    'HB':    692_000,
+    'HE':  6_391_000,
+    'HH':  1_910_000,
+    'MV':  1_628_000,
+    'NI':  8_162_000,
+    'NW': 18_190_000,
+    'RP':  4_174_000,
+    'SH':  2_966_000,
+    'SL':    994_000,
+    'SN':  4_086_000,
+    'ST':  2_145_000,
+    'TH':  2_120_000,
+}
+
 PANDEMIC_START = pd.Timestamp('2020-03-01', tz='Europe/Berlin')
 PANDEMIC_END   = pd.Timestamp('2021-12-31', tz='Europe/Berlin')
 
@@ -63,6 +85,14 @@ CITY_POPULATION = {
     'München':   1_471_508,
     'Köln':      1_085_664,
     'Frankfurt':   753_056,
+}
+
+# ---------------------------------------------------------------------------
+# Persisted ETL models
+# ---------------------------------------------------------------------------
+MODEL_FILENAMES = {
+    'LGBM': 'best_lgbm_model_bayesian_etl.pkl',
+    'XGBoost': 'best_xgb_model_bayesian_etl.pkl',
 }
 
 # ---------------------------------------------------------------------------

@@ -64,6 +64,8 @@ _FEATURE_DEPS: dict[str, list[str]] = {
     'is_weekend':      [],
     'is_holiday':      [],
     'holiday_ratio':   [],
+    'is_school_holiday': ['school_holiday_ratio'],
+    'school_holiday_ratio': [],
     'is_workday':      ['is_weekend', 'is_holiday'],
     'is_bridge_day':   ['is_holiday'],
     'holiday_weight':  ['holiday_ratio', 'is_weekend'],
@@ -107,7 +109,7 @@ class TimeFeatureCreator:
         ISO 3166-1 alpha-2 country code used by the `holidays` library (e.g. 'DE').
     state_codes : list[str]
         Subdivision codes for the country (e.g. German Bundesland codes).
-        Used to compute holiday_ratio (fraction of subdivisions with a holiday).
+        Used to compute holiday ratios as a share of the selected states' population.
     pandemic_start : pd.Timestamp | None
         Start of the pandemic flag period (inclusive, tz-aware).  None disables
         the is_pandemic_time feature even if it is in include_features.
@@ -119,8 +121,8 @@ class TimeFeatureCreator:
         Subset of built-in features to produce.  None means all features.
         Dependencies are resolved automatically.
         Available: year, hour, weekday, month, is_weekend, is_holiday,
-                   holiday_ratio, is_workday, is_bridge_day, holiday_weight,
-                   is_pandemic_time
+                   holiday_ratio, is_school_holiday, school_holiday_ratio,
+                   is_workday, is_bridge_day, holiday_weight, is_pandemic_time
     extra_feature_fns : list[Callable[[pd.DataFrame, str], pd.DataFrame]] | None
         Optional list of user-defined feature functions.  Each receives
         (df, time_column) and must return a DataFrame with new columns added.
@@ -131,6 +133,8 @@ class TimeFeatureCreator:
         self,
         country: str,
         state_codes: list[str],
+        state_weights: dict[str, float] | None = None,
+        school_holiday_dates: dict[str, set] | None = None,
         pandemic_start: pd.Timestamp | None = None,
         pandemic_end:   pd.Timestamp | None = None,
         time_column: str = 'time',
@@ -139,6 +143,13 @@ class TimeFeatureCreator:
     ) -> None:
         self.country    = country
         self.state_codes = list(state_codes)
+        self.state_weights = state_weights or {code: 1.0 for code in state_codes}
+        missing_weights = set(self.state_codes) - set(self.state_weights)
+        if missing_weights:
+            raise ValueError(f"Missing state weights: {sorted(missing_weights)}")
+        self.school_holiday_dates = school_holiday_dates or {
+            code: set() for code in state_codes
+        }
         self.pandemic_start = pandemic_start
         self.pandemic_end   = pandemic_end
         self.time_column    = time_column
@@ -155,11 +166,25 @@ class TimeFeatureCreator:
 
     def holiday_ratio(self, date) -> float:
         """Fraction of state_codes that observe a public holiday on *date*."""
-        count = sum(
-            1 for code in self.state_codes
+        holiday_population = sum(
+            self.state_weights[code] for code in self.state_codes
             if date in _cached_state_holidays(self.country, code, date.year)
         )
-        return count / len(self.state_codes)
+        total_population = sum(
+            self.state_weights[code] for code in self.state_codes
+        )
+        return holiday_population / total_population
+
+    def school_holiday_ratio(self, date) -> float:
+        """Population share living in states with school holidays on *date*."""
+        holiday_population = sum(
+            self.state_weights[code] for code in self.state_codes
+            if date in self.school_holiday_dates.get(code, set())
+        )
+        total_population = sum(
+            self.state_weights[code] for code in self.state_codes
+        )
+        return holiday_population / total_population
 
     def available_features(self) -> list[str]:
         """Return the list of built-in feature names this instance will produce."""
@@ -212,6 +237,16 @@ class TimeFeatureCreator:
 
         if 'holiday_ratio' in feat:
             out['holiday_ratio'] = out[col].dt.date.apply(self.holiday_ratio).astype(float)
+
+        if 'school_holiday_ratio' in feat:
+            out['school_holiday_ratio'] = (
+                out[col].dt.date.apply(self.school_holiday_ratio).astype(float)
+            )
+
+        if 'is_school_holiday' in feat:
+            out['is_school_holiday'] = (
+                out['school_holiday_ratio'] > 0
+            ).astype(int)
 
         if 'is_workday' in feat:
             out['is_workday'] = (
