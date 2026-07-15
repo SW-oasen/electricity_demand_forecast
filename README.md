@@ -34,7 +34,7 @@ Beim ersten Start führt die App `update_database()` aus und befüllt/aktualisie
 | Tab | Funktion |
 |---|---|
 | Vorhersage (morgen) | Energie-Lag-Kontext aus DB + Open-Meteo Wetter-Forecast → ML-Prognose für morgen inkl. SMARD-Vergleichslinie |
-| Historischer Vergleich | DB-Lastdaten + archivierte 48h-Wetterprognose → Walk-forward → CSV-Checkpoint → SQLite-Prognosetabelle; max. 1 Jahr, mit MAE + RMSE |
+| Historischer Vergleich | DB-Lastdaten + archivierte 48h-Wetterprognose → Walk-forward → CSV-Checkpoint; max. 1 Jahr, mit MAE + RMSE |
 
 ---
 
@@ -44,7 +44,7 @@ Als interaktive Oberfläche steht zusätzlich Notebook 08 in `notebook/` bereit:
 
 | Notebook | Art | Beschreibung |
 |---|---|---|
-| `08_interactive_prediction_etl.ipynb` | ETL | Rekursive Morgenprognose und historischer Walk-Forward-Vergleich mit CSV-/DB-Persistenz |
+| `08_interactive_prediction_etl.ipynb` | ETL | Rekursive Morgenprognose und historischer Walk-Forward-Vergleich mit CSV-Checkpoints |
 
 ### Notebook 08 — Aufbau
 
@@ -60,9 +60,9 @@ Als interaktive Oberfläche steht zusätzlich Notebook 08 in `notebook/` bereit:
 - Die Datumsauswahl endet automatisch am letzten vollständigen Isttag der Lasttabelle; angebrochene Tage sind nicht auswählbar.
 - Der kombinierte DB-View verwendet einen `LEFT JOIN`: Lastzeilen bleiben erhalten, auch wenn beobachtetes Wetter am D-1/D-Horizont noch fehlt.
 - Lastwerte werden rekursiv ohne Zukunftswissen erzeugt. Primär verwenden D-1 und Zieltag denselben, am Prognosezeitpunkt sicher verfügbaren archivierten ECMWF-Lauf.
-- Bei Lücken im ECMWF-Archiv wird auf die ebenfalls leakage-sichere Open-Meteo-Best-Match-Prognose mit festem 48-Stunden-Vorlauf zurückgegriffen. Fehlt dabei nur ein Standort, werden die verfügbaren Städte populationsgewichtet neu normiert; vollständig fehlende Stunden werden nicht imputiert und führen zum Abbruch.
+- Bei unvollständigen oder von der Single-Runs-API nicht archivierten ECMWF-Läufen (`400/404`) wird auf die ebenfalls leakage-sichere Open-Meteo-Best-Match-Prognose mit festem 48-Stunden-Vorlauf zurückgegriffen. Fehlt dabei nur ein Standort, werden die verfügbaren Städte populationsgewichtet neu normiert; vollständig fehlende Stunden werden nicht imputiert und führen zum Abbruch.
 - Wetterprognosen werden unter `data/cache/openmeteo_single_runs/` dauerhaft zwischengespeichert; der erste Abruf eines Zeitraums benötigt API-Zugriff
-- Jeder vollständige Tag wird sofort als CSV gesichert und anschließend in SQLite persistiert
+- Jeder vollständige Tag wird sofort als CSV gesichert. Solange die Walk-forward-Logik validiert wird, findet bewusst kein automatischer Import der Prognosen nach SQLite statt.
 - Auswählbarer Zeitraum bis maximal 1 Jahr; Live-Validierung verhindert ungültige Auswahl
 - Metriktabelle (MAE, RMSE, Datenpunkte) für ML-Prognose **und** SMARD-Prognose im Vergleich
 
@@ -72,9 +72,9 @@ Da Rohdaten, Datenbank und Modellartefakte nicht im Git-Repository liegen:
 
 Nach Änderungen an Kalenderfeatures zuerst die ETL-Pipeline ausführen. Sie migriert
 das Schema und führt den versionierten historischen Backfill aus. Anschließend die
-Modelle mit `06_ml_pipeline_etl.ipynb` neu trainieren. Bereits persistierte
-Walk-Forward-Prognosen stammen noch vom alten Modell und müssen vor einer neuen
-Evaluation bewusst aus CSV und Datenbank entfernt werden.
+Modelle mit `06_ml_pipeline_etl.ipynb` neu trainieren. Bereits vorhandene
+Walk-Forward-CSV-Checkpoints stammen noch vom alten Modell und müssen vor einer
+neuen Evaluation bewusst entfernt werden.
 
 1. Rohdaten unter `data/raw/` bereitstellen.
 2. `python -m src.etl` beziehungsweise `python src/etl.py` ausführen, um die DB aufzubauen.

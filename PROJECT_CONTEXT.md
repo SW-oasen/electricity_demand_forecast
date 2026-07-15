@@ -17,7 +17,7 @@ db/energy_demand.db
 ├── energy_demand   (inkrementell aktualisierte Last- und Kalenderfeatures)
 ├── weather         (inkrementell aktualisierte Wetterfeatures)
 ├── etl_metadata    (Versionen ausgeführter ETL-Backfills)
-├── walk_forward_predictions  (persistierte historische ML-Prognosen)
+├── walk_forward_predictions  (vorbereitet; aktuell kein automatischer Import)
 └── energy_weather_combined  (VIEW — LEFT JOIN von Last auf Wetter)
 ```
 
@@ -71,8 +71,8 @@ Die DB verwendet snake_case statt PascalCase:
 | `load_combined_data(conn, start_date, end_date)` | View mit optionalem Datumsfilter |
 | `prepare_for_prediction_tomorrow_etl(date, model, db_path)` | Prognostiziert zuerst rekursiv den fehlenden heutigen Tag und erzeugt daraus die Feature-Matrix für morgen |
 | `backfill_calendar_features(conn, ...)` | Befüllt versioniert die bevölkerungsgewichteten Feiertags- und Schulferienfeatures historischer DB-Zeilen |
-| `prediction_store.upsert_predictions(conn, predictions)` | CSV-Ergebnisse idempotent in SQLite speichern |
-| `prediction_store.load_predictions(...)` | Persistierte Walk-Forward-Prognosen nach Modell, Modus und Zeitraum laden |
+| `prediction_store.upsert_predictions(conn, predictions)` | Vorbereiteter, aktuell nicht automatisch aufgerufener Import konsolidierter CSV-Ergebnisse |
+| `prediction_store.load_predictions(...)` | Vorbereitete Abfrage später kontrolliert importierter Walk-Forward-Prognosen |
 
 ---
 
@@ -239,17 +239,18 @@ Zieltag `D`.
 
 Vollständig berechnete Tage werden je Modell unter
 `data/walk_forward_predictions/` als CSV zwischengespeichert. Ein erneuter Lauf
-überspringt bereits vollständige Tage. Die CSV-Dateien bleiben erhalten, bis die
-Ergebnisse erfolgreich in `walk_forward_predictions` geschrieben und abgeglichen
-wurden. Auch nach erfolgreichem Abgleich werden die CSV-Dateien nicht automatisch
-gelöscht.
+überspringt bereits vollständige Tage. Während der Validierungsphase der
+Walk-forward-Logik werden Prognosen bewusst nicht automatisch in die Tabelle
+`walk_forward_predictions` importiert. Eine spätere Konsolidierung der CSVs und
+ein kontrollierter DB-Import bleiben als eigener Arbeitsschritt vorgesehen.
 
 Der produktive Evaluationsmodus heißt `walk_forward_48h_archived_weather`. Für
 jeden Zieltag wird primär der letzte ECMWF-IFS-Lauf gewählt, der unter
 Berücksichtigung einer sechs Stunden langen Publikationsverzögerung am
 Forecast-Origin sicher verfügbar war. D-1 und D stammen vollständig aus diesem
-Lauf. Bei unvollständigen ECMWF-Archivläufen dient Open-Meteo Best Match mit
-festem 48-Stunden-Vorlauf als leakage-sicherer Fallback. Fehlt eine Variable nur
+Lauf. Bei unvollständigen oder von der Single-Runs-API nicht archivierten
+ECMWF-Läufen (`400/404`) dient Open-Meteo Best Match mit festem
+48-Stunden-Vorlauf als leakage-sicherer Fallback. Fehlt eine Variable nur
 für einzelne Städte, werden die verfügbaren Standorte populationsgewichtet neu
 normiert. Vollständig fehlende Stunden werden nicht imputiert und brechen die
 Evaluation ab. Die letzten 24 beobachteten Wetterstunden vor dem Origin dienen
@@ -257,8 +258,8 @@ ausschließlich als Kontext für Wetter-Lags und Rolling Features. Wetterdaten
 werden unter `data/cache/openmeteo_single_runs/` gecacht.
 
 Der frühere Best-Case-Modus `walk_forward_48h_actual_weather` bleibt technisch
-verfügbar und verwendet beobachtetes Wetter; seine CSV- und DB-Ergebnisse sind
-durch den Evaluationsmodus vom produktiven Backtest getrennt.
+verfügbar und verwendet beobachtetes Wetter; seine CSV-Ergebnisse sind durch den
+Evaluationsmodus vom produktiven Backtest getrennt.
 
 | Split | Zeitraum | Verwendung |
 |---|---|---|
@@ -329,7 +330,7 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 | `05_scrape_eda_smard.ipynb` | Historische SMARD-Analyse und Untersuchung des Prognoseverhaltens |
 | `06_ml_pipeline_etl.ipynb` | ETL-Training und Walk-Forward-Evaluation von LightGBM und XGBoost |
 | `07_feature_importances.ipynb` | Feature Importances, Ferienfeature-Analyse und Befunde zu konservativen Prognosen |
-| `08_interactive_prediction_etl.ipynb` | Rekursive Morgenprognose und historischer Walk-Forward-Vergleich mit CSV-/DB-Persistenz |
+| `08_interactive_prediction_etl.ipynb` | Rekursive Morgenprognose und historischer Walk-Forward-Vergleich mit CSV-Checkpoints |
 
 ### Notebook 08 — Implementierungsdetails
 
@@ -348,7 +349,7 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 **Teil 2 — Historischer Vergleich**
 
 - Quelldaten inklusive Warm-up-Kontext werden aus SQLite geladen; fehlende Zieltage werden per Walk-Forward berechnet
-- Ergebnisse werden tageweise als CSV gesichert, in SQLite persistiert und beim nächsten Abruf wiederverwendet
+- Ergebnisse werden tageweise als CSV gesichert und beim nächsten Abruf wiederverwendet; ein automatischer SQLite-Import ist während der Validierungsphase deaktiviert
 - Zeitraum frei wählbar (min. 2019-01-17, max. 1 Jahr und höchstens bis zum letzten vollständigen Isttag); Live-Validierung über `_validate_range()` sperrt den Compare-Button bei ungültiger Auswahl
 - X-Achsen-Format passt sich automatisch an den gewählten Zeitraum an (≤3 Tage: `%m-%d %H:%M`, ≤31 Tage: `%Y-%m-%d`, sonst: `%Y-%m`)
 - Metriktabelle (MAE, RMSE, Datenpunkte) für ML-Prognose **und** SMARD-Prognose nebeneinander
@@ -363,7 +364,7 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 | `walk_forward.py` | Leakage-sichere rekursive Feature- und Evaluationslogik sowie CSV-Checkpoint |
 | `historical_weather_forecast.py` | Single-Run-Auswahl, Previous-Runs-Fallback und Wetterfeature-Injektion für historische D-1/D-Horizonte |
 | `util/openmeteo_client.py` | Open-Meteo-Client für Archive, Single Runs und Previous Runs mit populationsgewichteter Aggregation und CSV-Cache |
-| `prediction_store.py` | SQLite-Schema, Upsert und Abfragen für persistierte Prognosen |
+| `prediction_store.py` | Vorbereitete SQLite-Persistenz für einen späteren kontrollierten Import konsolidierter Prognosen |
 | `forecast_service.py` | Gemeinsame Orchestrierung für Modelle, Morgenprognose, historische Evaluation und Metriken |
 | `streamlit_app_etl.py` | Rekursive Morgenprognose und historischer Walk-Forward-Vergleich |
 

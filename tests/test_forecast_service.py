@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import sqlite3
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -17,6 +18,40 @@ from forecast_service import (
 
 
 class ForecastServiceTests(unittest.TestCase):
+    def test_historical_evaluation_uses_csv_result_without_database_upsert(self):
+        times = pd.date_range(
+            "2025-01-01", periods=24, freq="h", tz="Europe/Berlin"
+        )
+        source = pd.DataFrame({
+            "time": times,
+            "energy_demand_mwh": 10.0,
+            "smard_forecast_mwh": 11.0,
+        })
+        predictions = pd.DataFrame({
+            "target_time": times,
+            "prediction_mwh": 12.0,
+        })
+        connection = Mock()
+
+        with patch("forecast_service.get_connection", return_value=connection), patch(
+            "forecast_service.load_combined_data", return_value=source
+        ), patch(
+            "forecast_service.predict_date_range_with_forecast_weather",
+            return_value=predictions,
+        ) as predict:
+            result = evaluate_historical_range(
+                model=Mock(),
+                model_name="LGBM",
+                start_date="2025-01-01",
+                end_date="2025-01-01",
+                csv_dir=Path("checkpoints"),
+            )
+
+        predict.assert_called_once()
+        connection.close.assert_called_once()
+        self.assertEqual(len(result), 24)
+        self.assertTrue((result["ML Prediction"] == 12.0).all())
+
     def test_latest_complete_actual_date_skips_partial_latest_day(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "energy.db"

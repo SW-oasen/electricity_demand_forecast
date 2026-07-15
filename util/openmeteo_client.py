@@ -221,6 +221,13 @@ class OpenMeteoClient:
                     response.raise_for_status()
                     data = response.json()
                     break
+                except requests.exceptions.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else None
+                    if status is not None and status < 500 and status != 429:
+                        raise
+                    if attempt == 2:
+                        raise
+                    time.sleep(5)
                 except requests.exceptions.RequestException:
                     if attempt == 2:
                         raise

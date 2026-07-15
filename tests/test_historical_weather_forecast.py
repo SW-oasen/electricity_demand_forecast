@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pandas as pd
+import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -125,6 +126,40 @@ class HistoricalWeatherForecastTests(unittest.TestCase):
         self.assertEqual(weather_source, "previous_runs_best_match:day2")
         horizon = result[result["time"] >= origin]
         self.assertTrue((horizon["apparent_temperature"] == 77.0).all())
+        client.fetch_previous_runs.assert_called_once()
+
+    def test_unavailable_single_run_uses_previous_runs_fallback(self):
+        source = self._source()
+        origin = pd.Timestamp("2025-01-09", tz="Europe/Berlin")
+        target_end = pd.Timestamp("2025-01-11", tz="Europe/Berlin")
+        fallback = pd.DataFrame({
+            "time": pd.date_range(origin, target_end, freq="h", inclusive="left")
+        })
+        for column in WEATHER_VARIABLES:
+            fallback[column] = 33.0
+
+        response = Mock(status_code=400)
+        client = Mock()
+        client.latest_available_run.return_value = pd.Timestamp(
+            "2025-01-08 12:00", tz="UTC"
+        )
+        client.fetch_single_run.side_effect = requests.HTTPError(
+            "unavailable run", response=response
+        )
+        client.fetch_previous_runs.return_value = fallback
+
+        with tempfile.TemporaryDirectory() as directory:
+            result, weather_source = inject_forecast_weather_horizon(
+                source,
+                "2025-01-10",
+                client=client,
+                cache_dir=Path(directory),
+            )
+
+        self.assertEqual(weather_source, "previous_runs_best_match:day2")
+        self.assertTrue(
+            (result.loc[result["time"] >= origin, "apparent_temperature"] == 33.0).all()
+        )
         client.fetch_previous_runs.assert_called_once()
 
     def test_rejects_incomplete_fallback_horizon(self):

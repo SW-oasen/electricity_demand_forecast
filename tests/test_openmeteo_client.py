@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pandas as pd
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -76,6 +77,20 @@ class OpenMeteoSingleRunTests(unittest.TestCase):
             self.client.fetch_single_run(
                 pd.Timestamp("2025-10-01 13:00", tz="UTC")
             )
+
+    def test_single_run_does_not_retry_bad_request(self):
+        response = Mock(status_code=400)
+        response.raise_for_status.side_effect = requests.HTTPError(
+            "unavailable run", response=response
+        )
+        with patch(
+            "util.openmeteo_client.requests.get", return_value=response
+        ) as request_get:
+            with self.assertRaises(requests.HTTPError):
+                self.client.fetch_single_run(
+                    pd.Timestamp("2025-12-30 12:00", tz="UTC")
+                )
+        self.assertEqual(request_get.call_count, 1)
 
     def test_previous_runs_renames_fixed_lead_variables(self):
         response = Mock()

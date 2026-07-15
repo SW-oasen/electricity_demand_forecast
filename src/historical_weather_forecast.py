@@ -6,6 +6,7 @@ from pathlib import Path
 from functools import partial
 
 import pandas as pd
+import requests
 
 from config import CITY_POPULATION, SELECTED_CITIES, WEATHER_VARIABLES
 from fetch_prepare_data import create_weather_features
@@ -90,17 +91,24 @@ def inject_forecast_weather_horizon(
 
     client = client or create_single_run_client()
     run = client.latest_available_run(forecast_origin)
-    archived_run = client.fetch_single_run(
-        run,
-        forecast_days=4,
-        model="ecmwf_ifs",
-        cache_dir=cache_dir,
-    )
-    forecast = archived_run.loc[
-        (archived_run["time"] >= forecast_origin)
-        & (archived_run["time"] < target_end),
-        ["time", *WEATHER_VARIABLES],
-    ].copy()
+    try:
+        archived_run = client.fetch_single_run(
+            run,
+            forecast_days=4,
+            model="ecmwf_ifs",
+            cache_dir=cache_dir,
+        )
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status not in {400, 404}:
+            raise
+        forecast = pd.DataFrame(columns=["time", *WEATHER_VARIABLES])
+    else:
+        forecast = archived_run.loc[
+            (archived_run["time"] >= forecast_origin)
+            & (archived_run["time"] < target_end),
+            ["time", *WEATHER_VARIABLES],
+        ].copy()
 
     source = f"single_run_ecmwf_ifs:{run.isoformat()}"
     complete_single_run = (

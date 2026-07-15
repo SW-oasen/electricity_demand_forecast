@@ -15,7 +15,6 @@ from etl import (
     load_combined_data,
     prepare_for_prediction_tomorrow_etl,
 )
-from prediction_store import load_predictions
 from train_model_predict import load_model_from_pickle
 from historical_weather_forecast import (
     FORECAST_WEATHER_EVALUATION_MODE,
@@ -25,7 +24,6 @@ from walk_forward import (
     EVALUATION_MODE,
     RECURSIVE_PREDICTION_COLUMN,
     predict_date_range,
-    sync_predictions_csv_to_database,
 )
 
 
@@ -115,12 +113,12 @@ def evaluate_historical_range(
             Path(csv_dir)
             / f"walk_forward_forecast_weather_{model_name.lower()}.csv"
         )
-        predict_date_range_with_forecast_weather(
+        predictions = predict_date_range_with_forecast_weather(
             model, source, start_date, end_date, model_name, csv_path
         )
     elif evaluation_mode == EVALUATION_MODE:
         csv_path = Path(csv_dir) / f"walk_forward_{model_name.lower()}.csv"
-        predict_date_range(
+        predictions = predict_date_range(
             model,
             source,
             start_date,
@@ -129,17 +127,6 @@ def evaluate_historical_range(
             csv_path,
             evaluation_mode=evaluation_mode,
         )
-    connection = get_connection(db_path)
-    try:
-        sync_predictions_csv_to_database(
-            csv_path, connection, model_name, evaluation_mode=evaluation_mode
-        )
-        predictions = load_predictions(
-            connection, model_name, evaluation_mode, start_date, end_date
-        )
-    finally:
-        connection.close()
-
     target_start = pd.Timestamp(start_date, tz="Europe/Berlin")
     target_end = pd.Timestamp(end_date, tz="Europe/Berlin") + pd.DateOffset(days=1)
     selected = source.loc[
@@ -147,7 +134,9 @@ def evaluate_historical_range(
     ]
     actual = selected.set_index("time")["energy_demand_mwh"].rename("Actual")
     smard = selected.set_index("time")["smard_forecast_mwh"].rename("SMARD Forecast")
-    prediction_time = predictions["target_time"].dt.tz_convert("Europe/Berlin")
+    prediction_time = pd.to_datetime(
+        predictions["target_time"], utc=True
+    ).dt.tz_convert("Europe/Berlin")
     ml = pd.Series(
         predictions["prediction_mwh"].to_numpy(),
         index=prediction_time,
