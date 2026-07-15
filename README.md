@@ -34,7 +34,7 @@ Beim ersten Start führt die App `update_database()` aus und befüllt/aktualisie
 | Tab | Funktion |
 |---|---|
 | Vorhersage (morgen) | Energie-Lag-Kontext aus DB + Open-Meteo Wetter-Forecast → ML-Prognose für morgen inkl. SMARD-Vergleichslinie |
-| Historischer Vergleich | DB-Quelldaten → Walk-forward → CSV-Checkpoint → SQLite-Prognosetabelle; max. 1 Jahr, mit MAE + RMSE. Lastwerte sind leakage-sicher, historische Wetterfeatures stammen derzeit noch aus beobachtetem Wetter. |
+| Historischer Vergleich | DB-Lastdaten + archivierte 48h-Wetterprognose → Walk-forward → CSV-Checkpoint → SQLite-Prognosetabelle; max. 1 Jahr, mit MAE + RMSE |
 
 ---
 
@@ -57,7 +57,11 @@ Als interaktive Oberfläche steht zusätzlich Notebook 08 in `notebook/` bereit:
 
 **Teil 2 — Historischer Vergleich (Actual vs. SMARD vs. ML)**
 - Quelldaten werden aus SQLite geladen; fehlende Walk-Forward-Tage werden berechnet
-- Lastwerte werden rekursiv ohne Zukunftswissen erzeugt; beobachtete historische Wetterwerte machen diesen Modus derzeit noch zu einer Best-Case-Auswertung
+- Die Datumsauswahl endet automatisch am letzten vollständigen Isttag der Lasttabelle; angebrochene Tage sind nicht auswählbar.
+- Der kombinierte DB-View verwendet einen `LEFT JOIN`: Lastzeilen bleiben erhalten, auch wenn beobachtetes Wetter am D-1/D-Horizont noch fehlt.
+- Lastwerte werden rekursiv ohne Zukunftswissen erzeugt. Primär verwenden D-1 und Zieltag denselben, am Prognosezeitpunkt sicher verfügbaren archivierten ECMWF-Lauf.
+- Bei Lücken im ECMWF-Archiv wird auf die ebenfalls leakage-sichere Open-Meteo-Best-Match-Prognose mit festem 48-Stunden-Vorlauf zurückgegriffen. Fehlt dabei nur ein Standort, werden die verfügbaren Städte populationsgewichtet neu normiert; vollständig fehlende Stunden werden nicht imputiert und führen zum Abbruch.
+- Wetterprognosen werden unter `data/cache/openmeteo_single_runs/` dauerhaft zwischengespeichert; der erste Abruf eines Zeitraums benötigt API-Zugriff
 - Jeder vollständige Tag wird sofort als CSV gesichert und anschließend in SQLite persistiert
 - Auswählbarer Zeitraum bis maximal 1 Jahr; Live-Validierung verhindert ungültige Auswahl
 - Metriktabelle (MAE, RMSE, Datenpunkte) für ML-Prognose **und** SMARD-Prognose im Vergleich
@@ -83,6 +87,8 @@ Evaluation bewusst aus CSV und Datenbank entfernt werden.
 |---|---|
 | `etl.py` | Quelldaten und Feature-DB |
 | `walk_forward.py` | Rekursive Prognose- und Evaluationslogik |
+| `historical_weather_forecast.py` | Archivierte, leakage-sichere Wetterprognosen für historische D-1/D-Horizonte |
+| `util/openmeteo_client.py` | Open-Meteo Archive-, Single-Run- und Previous-Runs-Client mit lokalem Cache |
 | `prediction_store.py` | Persistenz der Walk-Forward-Ergebnisse |
 | `forecast_service.py` | Gemeinsame Anwendungslogik für Streamlit und Notebook 08 |
 | `streamlit_app_etl.py` | Darstellung und Benutzerinteraktion |
@@ -131,7 +137,7 @@ Die orginal Daten sind bereinigt, aggregiert und transformiert für Machine Lear
 
 - ENTSO-E Day-Ahead-Preise als Feature
 - Industrieproduktionsindex (Destatis, monatlich)
-- Archivierte Open-Meteo-Modellläufe für eine realistische wetterseitige Walk-forward-Evaluation
+- Operative Morgenprognose und historischer Backtest auf dasselbe explizite Wettermodell vereinheitlichen
 - Mehrere Länder wegen besonderem Klima (FI – Finnland, ES – Spanien)
 - 7-Tage-Forecast (iterative/rekursive Vorhersage)
 

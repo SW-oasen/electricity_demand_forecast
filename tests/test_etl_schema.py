@@ -36,8 +36,30 @@ class EtlSchemaTests(unittest.TestCase):
                     "WHERE type = 'view' AND name = 'energy_weather_combined'"
                 ).fetchone()[0]
                 self.assertIn("school_holiday_ratio", view_sql)
+                self.assertIn("LEFT JOIN weather", view_sql)
             finally:
                 migrated.close()
+
+    def test_combined_view_preserves_energy_without_weather(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = create_database(Path(tmp) / "energy.db")
+            try:
+                conn.execute(
+                    "INSERT INTO energy_demand (time, energy_demand_mwh) "
+                    "VALUES (?, ?)",
+                    ("2025-07-14T23:00:00+0200", 42.0),
+                )
+                conn.commit()
+
+                row = conn.execute(
+                    "SELECT energy_demand_mwh, apparent_temperature "
+                    "FROM energy_weather_combined"
+                ).fetchone()
+
+                self.assertEqual(row[0], 42.0)
+                self.assertIsNone(row[1])
+            finally:
+                conn.close()
 
     def test_calendar_backfill_is_versioned_and_updates_rows(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -146,7 +146,7 @@ SELECT
     w.shortwave_radiation_0m_lag_24h, w.shortwave_radiation_0m_rolling_mean_24h,
     w.heating_degree, w.cooling_degree
 FROM energy_demand e
-JOIN weather w ON e.time = w.time
+LEFT JOIN weather w ON e.time = w.time
 """
 
 _ENERGY_DB_COLS = [

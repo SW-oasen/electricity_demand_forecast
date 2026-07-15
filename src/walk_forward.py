@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 import numpy as np
 import pandas as pd
@@ -113,6 +113,7 @@ def predict_target_day(
     combined_data: pd.DataFrame,
     target_date: str,
     model_name: str,
+    evaluation_mode: str = EVALUATION_MODE,
 ) -> pd.DataFrame:
     """Predict one target day after recursively predicting the preceding day.
 
@@ -158,7 +159,7 @@ def predict_target_day(
             "target_time": [timestamp for timestamp, _ in predictions],
             "forecast_origin": forecast_origin,
             "model_name": model_name,
-            "evaluation_mode": EVALUATION_MODE,
+            "evaluation_mode": evaluation_mode,
             "prediction_mwh": [value for _, value in predictions],
             "actual_mwh": [actual.get(timestamp, np.nan) for timestamp, _ in predictions],
             "created_at": created_at,
@@ -213,6 +214,8 @@ def predict_date_range(
     end_date: str,
     model_name: str,
     csv_path: Path,
+    evaluation_mode: str = EVALUATION_MODE,
+    predict_day: Callable | None = None,
 ) -> pd.DataFrame:
     """Predict and checkpoint every missing target day in an inclusive range."""
     start = pd.Timestamp(start_date)
@@ -238,7 +241,7 @@ def predict_date_range(
         if not cached.empty:
             matching = cached.loc[
                 (cached["model_name"] == model_name)
-                & (cached["evaluation_mode"] == EVALUATION_MODE),
+                & (cached["evaluation_mode"] == evaluation_mode),
                 "target_time",
             ]
             cached_keys = set(matching.dt.tz_convert("UTC"))
@@ -246,7 +249,22 @@ def predict_date_range(
             if expected_keys.issubset(cached_keys):
                 continue
 
-        daily = predict_target_day(model, data, str(day.date()), model_name)
+        if predict_day is None:
+            daily = predict_target_day(
+                model,
+                data,
+                str(day.date()),
+                model_name,
+                evaluation_mode=evaluation_mode,
+            )
+        else:
+            daily = predict_day(model, data, str(day.date()), model_name)
+        modes = set(daily["evaluation_mode"])
+        if modes != {evaluation_mode}:
+            raise ValueError(
+                f"Daily predictor returned evaluation modes {sorted(modes)}, "
+                f"expected {evaluation_mode}"
+            )
         cached = save_predictions_csv(daily, csv_path)
         for column in ("target_time", "forecast_origin"):
             cached[column] = pd.to_datetime(cached[column], utc=True)
@@ -257,7 +275,7 @@ def predict_date_range(
     range_end = (pd.Timestamp(end.date(), tz=timezone_name) + pd.DateOffset(days=1)).tz_convert("UTC")
     return cached.loc[
         (cached["model_name"] == model_name)
-        & (cached["evaluation_mode"] == EVALUATION_MODE)
+        & (cached["evaluation_mode"] == evaluation_mode)
         & (cached["target_time"] >= range_start)
         & (cached["target_time"] < range_end)
     ].sort_values("target_time").reset_index(drop=True)

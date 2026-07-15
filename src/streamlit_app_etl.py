@@ -4,8 +4,8 @@ Streamlit web app — Germany hourly energy demand forecast (ETL pipeline).
 Two sections:
   1. Vorhersage (morgen)  — predict the full next day using energy context
      loaded from the SQLite DB + live Open-Meteo weather forecast.
-  2. Historischer Vergleich — features, actuals and SMARD forecast are all
-     read from the pre-computed DB view (single SQL query, no live API calls).
+  2. Historischer Vergleich — demand/actuals come from SQLite; archived,
+     leakage-safe 48-hour weather forecasts are cached locally.
 
 Uses the ETL-trained LightGBM and XGBoost models from notebook 06.
 
@@ -37,6 +37,7 @@ from forecast_service import (
     error_metrics,
     evaluate_historical_range,
     forecast_tomorrow,
+    latest_complete_actual_date,
     load_project_models,
 )
 
@@ -271,19 +272,22 @@ with tab_hist:
     st.info(
         "ML-Prognosen werden jetzt als Walk-Forward-Evaluation berechnet: "
         "Zuerst wird der fehlende Vortag prognostiziert, danach der Zieltag. "
-        "Vollständige Tage werden als CSV zwischengespeichert; historische "
-        "Wetterfeatures stammen weiterhin aus beobachtetem Wetter."
+        "Primär verwenden D-1 und Zieltag denselben, am Prognosezeitpunkt "
+        "verfügbaren archivierten ECMWF-Lauf. Bei Archivlücken wird eine "
+        "Best-Match-Prognose mit festem 48-Stunden-Vorlauf genutzt. Wetter und vollständige "
+        "Prognosetage werden lokal gecacht; der erste Abruf kann daher dauern."
     )
     st.markdown(
         "Vergleich von tatsächlichem Verbrauch, SMARD-Prognose und ML-Vorhersage.  \n"
-        "Quelldaten kommen aus der DB; ML-Prognosen aus dem CSV-Zwischenspeicher.  \n"
+        "Last-Quelldaten kommen aus der DB; historische Wetterprognosen aus "
+        "Open-Meteo Single Runs bzw. dem leakage-sicheren 48h-Fallback.  \n"
         "Maximaler Zeitraum: **1 Jahr**."
     )
 
-    _default_to   = date.today() - timedelta(days=1)
+    _default_to   = latest_complete_actual_date()
     _default_from = _default_to - timedelta(days=6)
     _min_date     = date(2019, 1, 17)  # 168 actual hours required before D-1
-    _max_date     = date.today() - timedelta(days=1)
+    _max_date     = _default_to
 
     col1, col2, col3 = st.columns(3)
     with col1:

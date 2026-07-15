@@ -18,8 +18,12 @@ db/energy_demand.db
 ├── weather         (inkrementell aktualisierte Wetterfeatures)
 ├── etl_metadata    (Versionen ausgeführter ETL-Backfills)
 ├── walk_forward_predictions  (persistierte historische ML-Prognosen)
-└── energy_weather_combined  (VIEW — JOIN beider Tabellen)
+└── energy_weather_combined  (VIEW — LEFT JOIN von Last auf Wetter)
 ```
+
+Der `LEFT JOIN` erhält jede Lastzeile auch dann, wenn beobachtetes Wetter noch
+nicht vorliegt. Das ist für die historische Evaluation erforderlich, weil die
+Wetterwerte für D-1/D dort aus archivierten Prognosen eingesetzt werden.
 
 ### DB-Spalten (View `energy_weather_combined`)
 
@@ -240,9 +244,21 @@ Ergebnisse erfolgreich in `walk_forward_predictions` geschrieben und abgeglichen
 wurden. Auch nach erfolgreichem Abgleich werden die CSV-Dateien nicht automatisch
 gelöscht.
 
-Der Evaluationsmodus heißt `walk_forward_48h_actual_weather`: Das Last-Leakage
-ist ausgeschlossen, historische Wetterfeatures stammen derzeit jedoch aus
-beobachtetem Wetter und nicht aus archivierten Wetterprognosen.
+Der produktive Evaluationsmodus heißt `walk_forward_48h_archived_weather`. Für
+jeden Zieltag wird primär der letzte ECMWF-IFS-Lauf gewählt, der unter
+Berücksichtigung einer sechs Stunden langen Publikationsverzögerung am
+Forecast-Origin sicher verfügbar war. D-1 und D stammen vollständig aus diesem
+Lauf. Bei unvollständigen ECMWF-Archivläufen dient Open-Meteo Best Match mit
+festem 48-Stunden-Vorlauf als leakage-sicherer Fallback. Fehlt eine Variable nur
+für einzelne Städte, werden die verfügbaren Standorte populationsgewichtet neu
+normiert. Vollständig fehlende Stunden werden nicht imputiert und brechen die
+Evaluation ab. Die letzten 24 beobachteten Wetterstunden vor dem Origin dienen
+ausschließlich als Kontext für Wetter-Lags und Rolling Features. Wetterdaten
+werden unter `data/cache/openmeteo_single_runs/` gecacht.
+
+Der frühere Best-Case-Modus `walk_forward_48h_actual_weather` bleibt technisch
+verfügbar und verwendet beobachtetes Wetter; seine CSV- und DB-Ergebnisse sind
+durch den Evaluationsmodus vom produktiven Backtest getrennt.
 
 | Split | Zeitraum | Verwendung |
 |---|---|---|
@@ -298,7 +314,7 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 - **Timezone-Problem (behoben in ETL-App)**: Matplotlib konvertiert tz-aware Timestamps intern nach UTC beim Plotten. In `streamlit_app_etl.py` werden beide Serien (ML + SMARD) über `_strip_tz()` zu tz-naive Europe/Berlin normiert, bevor sie an matplotlib übergeben werden.
 - **pandas 3.0 Mixed-Timezone-Bug (behoben)**: `pd.to_datetime(col)` wirft `ValueError: Mixed timezones` bei Spalten mit gemischten UTC-Offsets (`+0100`/`+0200`). Fix: `pd.to_datetime(col, utc=True)` in `_parse_time_col` in `etl.py`.
 - **Operative Morgenprognose**: Istwerte werden strikt vor D-1 abgeschnitten. D-1 wird stündlich rekursiv prognostiziert und als Kontext für Zieltag D verwendet.
-- **Historische Wetterevaluation (offen)**: Der aktuelle Modus `walk_forward_48h_actual_weather` verwendet beobachtetes Wetter für D-1 und D und ist deshalb ein Best-Case-Szenario. Geplant ist eine As-of-Auswertung mit archivierten Open-Meteo Single Runs aus einem am Prognosezeitpunkt verfügbaren ECMWF-Modelllauf.
+- **Historische Wetterevaluation**: Der Standardmodus verwendet primär archivierte ECMWF Single Runs und bei Archivlücken eine Best-Match-Prognose mit festem 48-Stunden-Vorlauf. Run-Auswahl, D-1/D-Horizont und wetterseitige Lag-/Rolling-Features respektieren den historischen Informationsstand. Der kombinierte View behält durch `LEFT JOIN` vollständige Lasttage ohne beobachtetes Zielwetter. Der alte `actual_weather`-Modus ist nur noch ein optionaler Best-Case-Vergleich.
 
 ---
 
@@ -333,7 +349,7 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 
 - Quelldaten inklusive Warm-up-Kontext werden aus SQLite geladen; fehlende Zieltage werden per Walk-Forward berechnet
 - Ergebnisse werden tageweise als CSV gesichert, in SQLite persistiert und beim nächsten Abruf wiederverwendet
-- Zeitraum frei wählbar (min. 2019-01-08, max. 1 Jahr); Live-Validierung über `_validate_range()` sperrt den Compare-Button bei ungültiger Auswahl
+- Zeitraum frei wählbar (min. 2019-01-17, max. 1 Jahr und höchstens bis zum letzten vollständigen Isttag); Live-Validierung über `_validate_range()` sperrt den Compare-Button bei ungültiger Auswahl
 - X-Achsen-Format passt sich automatisch an den gewählten Zeitraum an (≤3 Tage: `%m-%d %H:%M`, ≤31 Tage: `%Y-%m-%d`, sonst: `%Y-%m`)
 - Metriktabelle (MAE, RMSE, Datenpunkte) für ML-Prognose **und** SMARD-Prognose nebeneinander
 
@@ -345,6 +361,8 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 | `train_model_predict.py` | Modelltraining, Hyperparameter-Tuning, Modell-Persistenz |
 | `etl.py` | ETL-Pipeline: SQLite-DB erstellen/aktualisieren; Read-Helfer (`load_combined_data`, `prepare_for_prediction_tomorrow_etl`) |
 | `walk_forward.py` | Leakage-sichere rekursive Feature- und Evaluationslogik sowie CSV-Checkpoint |
+| `historical_weather_forecast.py` | Single-Run-Auswahl, Previous-Runs-Fallback und Wetterfeature-Injektion für historische D-1/D-Horizonte |
+| `util/openmeteo_client.py` | Open-Meteo-Client für Archive, Single Runs und Previous Runs mit populationsgewichteter Aggregation und CSV-Cache |
 | `prediction_store.py` | SQLite-Schema, Upsert und Abfragen für persistierte Prognosen |
 | `forecast_service.py` | Gemeinsame Orchestrierung für Modelle, Morgenprognose, historische Evaluation und Metriken |
 | `streamlit_app_etl.py` | Rekursive Morgenprognose und historischer Walk-Forward-Vergleich |
@@ -358,6 +376,7 @@ Scoring: `neg_mean_absolute_error` (MAE praxisrelevanter als R² für Lastvorher
 - [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)
 - [Open-Meteo Forecast API](https://open-meteo.com/en/docs)
 - [Open-Meteo Single Runs API](https://open-meteo.com/en/docs/single-runs-api)
+- [Open-Meteo Previous Runs API](https://open-meteo.com/en/docs/previous-runs-api)
 - [python-holidays](https://holidays.readthedocs.io/)
 - [scikit-optimize – BayesSearchCV](https://scikit-optimize.github.io/stable/modules/generated/skopt.BayesSearchCV.html)
 - [Deutsche Schulferien API](https://ferien-api.de/)
@@ -410,5 +429,5 @@ Historische Evaluation und operative Morgenprognose verwenden denselben position
 
 ### Offen
 
-- [ ] Historische Walk-forward-Evaluation auf archivierte Open-Meteo Single Runs umstellen
+- [x] Historische Walk-forward-Evaluation auf archivierte Open-Meteo-Wetterprognosen umgestellt
 - [ ] Strompreis-Vorhersage — separates Folgeprojekt

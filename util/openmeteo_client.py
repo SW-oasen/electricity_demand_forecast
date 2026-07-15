@@ -28,13 +28,22 @@ Returned DataFrames always have:
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pandas as pd
 import requests
+import truststore
+
+
+# Requests otherwise uses only certifi. On managed Windows installations the
+# required issuer may live in the OS trust store; this keeps verification active.
+truststore.inject_into_ssl()
 
 
 _ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 _FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+_SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
+_PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 
 
 class OpenMeteoClient:
@@ -79,12 +88,33 @@ class OpenMeteoClient:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _merge_cities(self, city_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    def _merge_cities(
+        self,
+        city_dict: dict[str, pd.DataFrame],
+        renormalize_available: bool = False,
+    ) -> pd.DataFrame:
         """
         Population-weight the per-city DataFrames into one aggregate DataFrame.
         The 'time' column is taken from the first city; numeric columns are
-        weighted-summed across cities.
+        weighted-summed across cities. With ``renormalize_available``, missing
+        values at individual locations are excluded and the remaining
+        population weights are normalized per variable and timestamp.
         """
+        if renormalize_available:
+            first = next(iter(city_dict.values()))
+            out = first[["time"]].copy()
+            for variable in self.weather_variables:
+                numerator = pd.Series(0.0, index=out.index)
+                denominator = pd.Series(0.0, index=out.index)
+                for city, city_data in city_dict.items():
+                    values = city_data[variable].reset_index(drop=True)
+                    available = values.notna()
+                    weight = self._weights[city]
+                    numerator = numerator.add(values.fillna(0.0) * weight)
+                    denominator = denominator.add(available.astype(float) * weight)
+                out[variable] = numerator.div(denominator.where(denominator > 0))
+            return out
+
         out = pd.DataFrame()
         for city, df_city in city_dict.items():
             w = self._weights[city]
@@ -103,6 +133,194 @@ class OpenMeteoClient:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def latest_available_run(
+        forecast_origin: pd.Timestamp,
+        availability_delay_hours: int = 6,
+    ) -> pd.Timestamp:
+        """Return the latest six-hourly run safely available at an origin.
+
+        Open-Meteo documents a typical 4–6 hour publication delay for global
+        models. Using the upper bound prevents selecting a run that had been
+        initialised but was not yet publicly available at ``forecast_origin``.
+        """
+        origin = pd.Timestamp(forecast_origin)
+        if origin.tzinfo is None:
+            raise ValueError("forecast_origin must be timezone-aware")
+        cutoff = origin.tz_convert("UTC") - pd.Timedelta(
+            hours=availability_delay_hours
+        )
+        run_hour = (cutoff.hour // 6) * 6
+        return cutoff.normalize() + pd.Timedelta(hours=run_hour)
+
+    def fetch_single_run(
+        self,
+        run: pd.Timestamp,
+        forecast_days: int = 4,
+        model: str = "ecmwf_ifs",
+        cache_dir: Path | None = None,
+    ) -> pd.DataFrame:
+        """Fetch and population-weight one archived Open-Meteo model run.
+
+        ``run`` is the model initialisation time in UTC. When ``cache_dir`` is
+        supplied, the aggregated run is stored atomically as CSV and reused on
+        subsequent calls. No TLS verification is disabled by this client.
+        """
+        run = pd.Timestamp(run)
+        if run.tzinfo is None:
+            raise ValueError("run must be timezone-aware")
+        run_utc = run.tz_convert("UTC")
+        if run_utc.minute or run_utc.second or run_utc.hour % 6:
+            raise ValueError("run must be a 00/06/12/18 UTC model cycle")
+        if not 1 <= forecast_days <= 16:
+            raise ValueError("forecast_days must be between 1 and 16")
+
+        cache_path = None
+        if cache_dir is not None:
+            safe_model = "".join(
+                char for char in model if char.isalnum() or char in ("-", "_")
+            )
+            cache_path = (
+                Path(cache_dir)
+                / safe_model
+                / f"{run_utc.strftime('%Y%m%dT%H%MZ')}_{forecast_days}d.csv"
+            )
+            if cache_path.exists():
+                cached = pd.read_csv(cache_path)
+                required = {"time", *self.weather_variables}
+                if required.issubset(cached.columns):
+                    cached["time"] = (
+                        pd.to_datetime(cached["time"], utc=True)
+                        .dt.tz_convert("Europe/Berlin")
+                        .dt.as_unit("s")
+                    )
+                    return cached.sort_values("time").reset_index(drop=True)
+
+        city_dict: dict[str, pd.DataFrame] = {}
+        params_base = {
+            "hourly": ",".join(self.weather_variables),
+            "models": model,
+            "run": run_utc.strftime("%Y-%m-%dT%H:%M"),
+            "timezone": "UTC",
+            "forecast_days": forecast_days,
+        }
+        for city, coords in self.cities.items():
+            params = {
+                **params_base,
+                "latitude": coords["latitude"],
+                "longitude": coords["longitude"],
+            }
+            for attempt in range(3):
+                try:
+                    response = requests.get(
+                        _SINGLE_RUNS_URL,
+                        params=params,
+                        timeout=self.timeout,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    break
+                except requests.exceptions.RequestException:
+                    if attempt == 2:
+                        raise
+                    time.sleep(5)
+
+            df_city = pd.DataFrame(data["hourly"])
+            missing = set(self.weather_variables) - set(df_city.columns)
+            if missing:
+                raise ValueError(
+                    f"Single Runs response for {city} lacks variables: "
+                    f"{sorted(missing)}"
+                )
+            df_city["time"] = (
+                pd.to_datetime(df_city["time"], utc=True)
+                .dt.tz_convert("Europe/Berlin")
+                .dt.as_unit("s")
+            )
+            city_dict[city] = df_city[["time", *self.weather_variables]]
+            time.sleep(self.city_sleep)
+
+        result = self._merge_cities(city_dict).sort_values("time").reset_index(drop=True)
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            to_cache = result.copy()
+            to_cache["time"] = to_cache["time"].dt.strftime(
+                "%Y-%m-%dT%H:%M:%S%z"
+            )
+            to_cache.to_csv(temporary, index=False)
+            temporary.replace(cache_path)
+        return result
+
+    def fetch_previous_runs(
+        self,
+        start_date: str,
+        end_date: str,
+        lead_days: int = 2,
+        cache_dir: Path | None = None,
+    ) -> pd.DataFrame:
+        """Fetch fixed-lead archived forecasts, using Open-Meteo Best Match."""
+        if not 1 <= lead_days <= 7:
+            raise ValueError("lead_days must be between 1 and 7")
+        suffix = f"_previous_day{lead_days}"
+        requested = [f"{name}{suffix}" for name in self.weather_variables]
+        cache_path = None
+        if cache_dir is not None:
+            cache_path = (
+                Path(cache_dir)
+                / "previous_runs_best_match"
+                / f"{start_date}_{end_date}_{lead_days}d_v2.csv"
+            )
+            if cache_path.exists():
+                cached = pd.read_csv(cache_path)
+                required = {"time", *self.weather_variables}
+                if required.issubset(cached.columns):
+                    cached["time"] = (
+                        pd.to_datetime(cached["time"], utc=True)
+                        .dt.tz_convert("Europe/Berlin")
+                        .dt.as_unit("s")
+                    )
+                    return cached.sort_values("time").reset_index(drop=True)
+
+        city_dict: dict[str, pd.DataFrame] = {}
+        for city, coords in self.cities.items():
+            params = {
+                "latitude": coords["latitude"],
+                "longitude": coords["longitude"],
+                "start_date": start_date,
+                "end_date": end_date,
+                "hourly": ",".join(requested),
+                "timezone": "UTC",
+            }
+            response = requests.get(
+                _PREVIOUS_RUNS_URL, params=params, timeout=self.timeout
+            )
+            response.raise_for_status()
+            df_city = pd.DataFrame(response.json()["hourly"]).rename(
+                columns={forecast: actual for forecast, actual in zip(requested, self.weather_variables)}
+            )
+            df_city["time"] = (
+                pd.to_datetime(df_city["time"], utc=True)
+                .dt.tz_convert("Europe/Berlin")
+                .dt.as_unit("s")
+            )
+            city_dict[city] = df_city[["time", *self.weather_variables]]
+            time.sleep(self.city_sleep)
+
+        result = (
+            self._merge_cities(city_dict, renormalize_available=True)
+            .sort_values("time")
+            .reset_index(drop=True)
+        )
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            to_cache = result.copy()
+            to_cache["time"] = to_cache["time"].dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+            to_cache.to_csv(temporary, index=False)
+            temporary.replace(cache_path)
+        return result
 
     def fetch_archive(self, start_date: str, end_date: str) -> pd.DataFrame:
         """

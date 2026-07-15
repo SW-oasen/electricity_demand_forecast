@@ -29,4 +29,5 @@ dependencies = [
     "streamlit>=1.45.0",
     "scikit-optimize>=0.10.2",
     "trampoline>=0.1.2",
+    "truststore>=0.10.4",
 ]
